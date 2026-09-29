@@ -1,0 +1,2122 @@
+Vou analisar os modelos, a gravação e a sincronização antes de alterar o código. Depois ajustarei o resumo no mobile e o cadastro de clientes pelo orçamento, preservando o fluxo de clientes já cadastrados, e testarei os cenários que você listou.
+
+
+
+
+  Ran commandsRan git status --short
+rg --files -g AGENTS.md -g '*test*' central-app
+Get-Content -Encoding UTF8 central-app/public/workspace.js
+Get-Content -Encoding UTF8 central-app/public/sync.js
+Shell
+$git status --short
+rg --files -g AGENTS.md -g '*test*' central-app
+Get-Content -Encoding UTF8 central-app/public/workspace.js
+Get-Content -Encoding UTF8 central-app/public/sync.js
+
+
+ M .gitignore
+ M README.md
+ M aplicativos/LEIA-ME.md
+ M aplicativos/SHA256SUMS.txt
+ M aplicativos/VALIDACAO.md
+ M aplicativos/previa-celular.png
+ M aplicativos/previa-pc.png
+ M central-app/android/app/build.gradle
+ M central-app/android/app/src/main/AndroidManifest.xml
+ M central-app/android/app/src/main/java/br/com/altimax/orcamentos/MainActivity.java
+ M central-app/desktop/main.cjs
+ M central-app/desktop/preload.cjs
+ M central-app/desktop/store.cjs
+ M central-app/package-lock.json
+ M central-app/package.json
+ M central-app/public/app.js
+ M central-app/public/index.html
+ M central-app/public/workspace.js
+ M central-app/tests/interface.py
+ M central-app/tests/windows.py
+ M central-app/tests/workspace.test.cjs
+?? aplicativos/previa-gestao-celular.png
+?? aplicativos/previa-gestao-pc.png
+?? aplicativos/previa-login-celular.png
+?? aplicativos/previa-login-pc.png
+?? aplicativos/teste-android-v2.png
+?? central-app/android/app/src/main/java/br/com/altimax/orcamentos/Cloud.java
+?? central-app/android/app/src/main/java/br/com/altimax/orcamentos/ProtectedFile.java
+?? central-app/desktop/cloud.cjs
+?? central-app/public/sync.js
+?? central-app/tests/cloud.test.cjs
+?? central-app/tests/sync.test.cjs
+?? scripts/preparar_catalogo_supabase.py
+?? supabase/
+central-app\tests\workspace.test.cjs
+central-app\tests\sync.test.cjs
+central-app\tests\cloud.test.cjs
+'use strict';
+const Workspace=(()=>{
+  const copy=x=>JSON.parse(JSON.stringify(x));
+  const id=()=>crypto.randomUUID();
+  const entities={clients:['name','phone','email','address','notes'],reports:['title','quoteId','clientId','date','findings','workDone','recommendations'],jobs:['title','quoteId','clientId','date','status','notes'],payments:['title','quoteId','date','amount','method','notes'],settings:['title','value']};
+  const empty=()=>({version:2,quotes:[],rates:{},clients:[],reports:[],jobs:[],payments:[],settings:[]});
+  function validRevision(r){return r&&typeof r.rev==='string'&&/^[\w-]{1,80}$/.test(r.rev)&&Array.isArray(r.parents)&&r.parents.length<=128&&r.parents.every(p=>typeof p==='string'&&/^[\w-]{1,80}$/.test(p));}
+  function validate(value){
+    if(!value||value.version!==2||!Array.isArray(value.quotes)||value.quotes.length>1000||!value.rates||typeof value.rates!=='object'||Array.isArray(value.rates))throw new Error('Arquivo de orçamentos inválido.');
+    const result=empty(),ids=new Set();
+    for(const q of value.quotes){
+      if(!q||typeof q.id!=='string'||!/^[\w-]{1,80}$/.test(q.id)||ids.has(q.id)||!validRevision(q)||!['rascunho','preparado','aprovado'].includes(q.status)||typeof q.updatedAt!=='string'||!Number.isFinite(Date.parse(q.updatedAt)))throw new Error('Orçamento inválido no arquivo.');
+      ids.add(q.id);result.quotes.push({id:q.id,rev:q.rev,parents:[...q.parents],status:q.status,updatedAt:q.updatedAt,draft:Quote.validateDraft(q.draft)});
+    }
+    for(const [key,r] of Object.entries(value.rates)){
+      if(!/^S\d{3}$/.test(key)||!validRevision(r)||typeof r.price!=='number'||!Number.isFinite(r.price)||r.price<=0||r.price>1000000)throw new Error('Preço inválido no arquivo.');
+      result.rates[key]={price:Math.round(r.price*100)/100,rev:r.rev,parents:[...r.parents]};
+    }
+    for(const [collection,fields] of Object.entries(entities)){
+      const entries=value[collection]??[];if(!Array.isArray(entries)||entries.length>3000)throw new Error('Lista de dados inválida.');const seen=new Set();
+      result[collection]=entries.map(e=>{
+        if(!e||!validRevision(e)||typeof e.id!=='string'||!/^[\w-]{1,80}$/.test(e.id)||seen.has(e.id)||!Number.isFinite(Date.parse(e.updatedAt)))throw new Error('Registro inválido.');seen.add(e.id);
+        const clean={id:e.id,rev:e.rev,parents:[...e.parents],updatedAt:e.updatedAt,deleted:!!e.deleted};
+        for(const f of fields){if(typeof e[f]!=='string'||e[f].length>5000)throw new Error('Campo inválido: '+f);clean[f]=e[f];}
+        if(collection==='payments'&&(!/^\d+(\.\d{1,2})?$/.test(clean.amount)||Number(clean.amount)>1000000))throw new Error('Pagamento inválido.');return clean;
+      });
+    }
+    return result;
+  }
+  function revision(previous){return {rev:id(),parents:previous?[...previous.parents,previous.rev].slice(-128):[]};}
+  function updateQuote(workspace,draft,quoteId,status='rascunho'){
+    const previous=workspace.quotes.find(q=>q.id===quoteId);
+    const entry={id:quoteId||id(),...revision(previous),status,updatedAt:new Date().toISOString(),draft:Quote.validateDraft(draft)};
+    workspace.quotes=workspace.quotes.filter(q=>q.id!==entry.id);workspace.quotes.unshift(entry);return entry.id;
+  }
+  function updateRate(workspace,serviceId,price){if(!Number.isFinite(price)||price<=0||price>1000000)throw new Error('Defina um preço válido.');workspace.rates[serviceId]={price:Math.round(price*100)/100,...revision(workspace.rates[serviceId])};}
+  function updateEntity(workspace,collection,fields,recordId){if(!entities[collection])throw new Error('Categoria inválida.');const previous=workspace[collection].find(e=>e.id===recordId);const entry={...fields,id:recordId||id(),...revision(previous),updatedAt:new Date().toISOString()};const check=empty();check[collection]=[entry];const clean=validate(check)[collection][0];workspace[collection]=workspace[collection].filter(e=>e.id!==clean.id);workspace[collection].unshift(clean);return clean.id;}
+  function merge(first,second){
+    const a=validate(first),b=validate(second),conflicts=[];
+    for(const incoming of b.quotes){
+      const current=a.quotes.find(q=>q.id===incoming.id);
+      if(!current){a.quotes.push(incoming);continue;}
+      if(current.rev===incoming.rev||current.parents.includes(incoming.rev))continue;
+      if(incoming.parents.includes(current.rev)){a.quotes[a.quotes.indexOf(current)]=incoming;continue;}
+      const winner=current.rev>incoming.rev?current:incoming,loser=winner===current?incoming:current;
+      a.quotes[a.quotes.indexOf(current)]=winner;
+      const duplicate=copy(loser);duplicate.id='copy-'+loser.rev.slice(0,70);duplicate.draft.reference+=' (cópia para conferir)';
+      if(!a.quotes.some(q=>q.id===duplicate.id)){a.quotes.push(duplicate);conflicts.push('Duas edições de '+incoming.draft.reference+' foram preservadas.');}
+    }
+    for(const [key,incoming] of Object.entries(b.rates)){
+      const current=a.rates[key];
+      if(!current||incoming.parents.includes(current.rev)){a.rates[key]=incoming;continue;}
+      if(current.rev===incoming.rev||current.parents.includes(incoming.rev))continue;
+      const winner=current.rev>incoming.rev?current:incoming,other=winner===current?incoming:current;
+      if(current.price!==incoming.price)conflicts.push(`Preço ${key}: mantido ${winner.price.toFixed(2)}; outra versão ${other.price.toFixed(2)}. Confira em Meus preços.`);
+      // Preserve a combined ancestry so the same price conflict is not repeated.
+      a.rates[key]={price:winner.price,rev:id(),parents:[...new Set([...current.parents,current.rev,...incoming.parents,incoming.rev])].slice(-128)};
+    }
+    for(const collection of Object.keys(entities))for(const incoming of b[collection]){
+      const current=a[collection].find(e=>e.id===incoming.id);
+      if(!current){a[collection].push(incoming);continue;}
+      if(current.rev===incoming.rev||current.parents.includes(incoming.rev))continue;
+      if(incoming.parents.includes(current.rev)){a[collection][a[collection].indexOf(current)]=incoming;continue;}
+      const winner=current.rev>incoming.rev?current:incoming,loser=winner===current?incoming:current;
+      a[collection][a[collection].indexOf(current)]=winner;
+      const duplicate={...loser,id:'copy-'+loser.rev.slice(0,70)};
+      if(!a[collection].some(e=>e.id===duplicate.id)){a[collection].push(duplicate);conflicts.push('Edições diferentes de '+(incoming.name||incoming.title||collection)+' foram preservadas em registros separados.');}
+    }
+    a.quotes.sort((x,y)=>y.updatedAt.localeCompare(x.updatedAt));return {data:a,conflicts};
+  }
+  return {empty,validate,revision,updateQuote,updateRate,updateEntity,entities,merge};
+})();
+if(typeof module!=='undefined')module.exports=Workspace;
+'use strict';
+const Sync=(()=>{
+  const collections={client:'clients',report:'reports',job:'jobs',payment:'payments',settings:'settings'};
+  function records(workspace){const w=Workspace.validate(workspace);return [...w.quotes.map(q=>({kind:'quote',id:q.id,payload:q})),...Object.entries(w.rates).map(([id,payload])=>({kind:'rate',id,payload})),...Object.entries(collections).flatMap(([kind,key])=>w[key].map(payload=>({kind,id:payload.id,payload})))];}
+  function decode(rows){const w=Workspace.empty();for(const r of rows){if(!Number.isSafeInteger(r.revision)||r.revision<1)throw new Error('Revisão do servidor inválida.');if(r.kind==='quote'){if(r.payload.id!==r.id)throw new Error('Identidade de orçamento inválida.');w.quotes.push(r.payload);}else if(r.kind==='rate')w.rates[r.id]=r.payload;else if(collections[r.kind]){if(r.payload.id!==r.id)throw new Error('Identidade de registro inválida.');w[collections[r.kind]].push(r.payload);}}return Workspace.validate(w);}
+  async function exchange(local,call){
+    let data=Workspace.validate(local),conflicts=[],catalog=[];
+    for(let attempt=0;attempt<3;attempt++){
+      const remote=await call('pull');catalog=remote.catalog;const merged=Workspace.merge(data,decode(remote.rows));data=merged.data;conflicts.push(...merged.conflicts);
+      const versions=new Map(remote.rows.map(r=>[r.kind+':'+r.id,r]));let retry=false;
+      for(const r of records(data)){
+        const old=versions.get(r.kind+':'+r.id);if(old?.payload?.rev===r.payload.rev)continue;
+        const result=await call('push',{record:r,revision:old?.revision??null});
+        if(result?.conflict||!Array.isArray(result)||result.length!==1){retry=true;break;}
+      }
+      if(!retry)return {data,conflicts:[...new Set(conflicts)],catalog};
+    }
+    throw new Error('Os aparelhos estão alterando os mesmos dados. As versões locais foram mantidas; tente sincronizar novamente.');
+  }
+  return {records,decode,exchange};
+})();
+if(typeof module!=='undefined')module.exports=Sync;
+
+
+
+
+
+
+Success
+
+
+
+
+
+
+Ran Get-Content -Encoding UTF8 central-app/public/app.js
+Get-Content -Encoding UTF8 interno/orcamento.js
+Get-Content -Encoding UTF8 central-app/public/app.css
+Shell
+$Get-Content -Encoding UTF8 central-app/public/app.js
+Get-Content -Encoding UTF8 interno/orcamento.js
+Get-Content -Encoding UTF8 central-app/public/app.css
+
+
+'use strict';
+(async()=>{
+  const $=id=>document.getElementById(id),services=ALTIMAX_INTERNAL_SERVICES;
+  const money=value=>Quote.money(Math.round(value*100));
+  const firstVisit=s=>['S001','S013'].includes(s.id)&&!workspace.rates[s.id];
+  const normalize=value=>String(value).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
+  let workspace=Workspace.empty(),activeId=null,category='Mais usados',view='builder',platform='unknown',editing=null,saveTimer,saveChain=Promise.resolve(),loaded=false;
+  const blank=()=>({version:1,items:[],client:'',location:'',phone:'',reference:`ALT-${new Date().toISOString().slice(0,10).replaceAll('-','')}-${crypto.randomUUID().slice(0,6).toUpperCase()}`,kind:'Pré-orçamento',scope:'',validity:'7 dias a partir do envio',schedule:'Data e horário a combinar',payment:'A combinar',notes:'',surchargeReason:'',minimum:120,percent:0,materials:0,travel:0,discount:0});
+  let draft=blank();
+  const element=(tag,className,text)=>{const e=document.createElement(tag);if(className)e.className=className;if(text!==undefined)e.textContent=text;return e;};
+  function toast(message){$('toast').textContent=message;$('toast').hidden=false;clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('toast').hidden=true,6000);}
+  function state(){return {version:2,workspace,active:{id:activeId,draft}};}
+  function persist(){
+    if(!loaded)return;
+    $('sync-state').textContent='Salvando…';
+    clearTimeout(saveTimer);saveTimer=setTimeout(()=>{
+      const data=JSON.parse(JSON.stringify(state()));
+      saveChain=saveChain.catch(()=>{}).then(()=>Native.request('save',{state:data})).then(result=>{
+        if(result?.workspace)workspace=Workspace.merge(result.workspace,workspace).data;
+        $('sync-state').textContent='Salvo neste aparelho';queueSync();
+      }).catch(e=>{$('sync-state').textContent='Falha ao salvar';toast(e.message+' Exporte um backup.');});
+    },250);
+  }
+  async function flush(){if(!loaded)throw new Error('Os dados não foram abertos. Feche e reabra o aplicativo para preservar o arquivo existente.');clearTimeout(saveTimer);await saveChain.catch(()=>{});const result=await Native.request('save',{state:state()});if(result?.workspace)workspace=Workspace.merge(result.workspace,workspace).data;}
+  window.altimaxFlush=flush;
+  function price(s){return workspace.rates[s.id]?.price??s.low;}
+  function setView(next){view=next;for(const name of ['builder','saved','prices','business'])$(name+'-view').hidden=name!==view;document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view===view));$('mobile-total').hidden=view!=='builder';$('basket').classList.remove('open');if(view==='saved')renderSaved();if(view==='prices')renderPrices();if(view==='business')renderEntities();window.scrollTo(0,0);}
+  document.querySelectorAll('[data-view]').forEach(b=>b.addEventListener('click',()=>setView(b.dataset.view)));
+  function renderCategories(){
+    $('categories').replaceChildren();
+    for(const c of ['Mais usados','Todos',...new Set(services.map(s=>s.category))]){const b=element('button','chip'+(c===category?' active':''),c);b.addEventListener('click',()=>{category=c;renderCategories();renderCards();});$('categories').append(b);}
+  }
+  function renderCards(){
+    const term=normalize($('search').value);
+    const filtered=services.filter(s=>(category==='Todos'||category==='Mais usados'&&(term||price(s)!=null)||category===s.category)&&normalize(s.name+' '+s.category).includes(term));
+    $('catalog-title').textContent=term?'Resultado da busca':category;
+    $('catalog-count').textContent=`${filtered.length} serviço${filtered.length===1?'':'s'}`;
+    $('cards').replaceChildren();
+    for(const s of filtered){
+      const card=element('article','service-card'),top=element('div','card-top');
+      top.append(element('span','service-symbol',s.category==='Iluminação'?'☼':s.category==='Chuveiros'?'≋':s.category==='Ventiladores'?'✣':'ϟ'),element('span','category-tag',s.category));
+      card.append(top,element('h3','',s.name));
+      const bottom=element('div','card-bottom'),value=price(s),p=element('div','card-price'+(value==null?' undefined':''),value==null?'Definir valor':money(value));
+      p.append(element('small','',workspace.rates[s.id]?'seu preço · '+s.unit:value==null?'conforme o serviço':firstVisit(s)?'referência de atendimento inicial':'referência · '+s.unit));
+      const add=element('button','card-add','+');add.setAttribute('aria-label',`Adicionar ${s.name}`);add.addEventListener('click',()=>value==null?openService(s,'add'):addItem(s,value));bottom.append(p,add);card.append(bottom);$('cards').append(card);
+    }
+    if(!filtered.length)$('cards').append(element('p','empty-state','Não encontramos esse serviço. Tente outro nome ou adicione um item personalizado.'));
+  }
+  function addItem(s,value){
+    const existing=draft.items.find(i=>i.id===s.id);
+    if(existing){if(existing.quantity>=99){toast('Limite de 99 unidades por serviço.');return;}if(firstVisit(s)){openService({...s,...existing},'edit');editing.quantity=existing.quantity+1;return;}existing.quantity++;}
+    else {if(draft.items.length>=200){toast('Limite de 200 itens por orçamento.');return;}draft.items.push({id:s.id,name:s.name,quantity:1,price:value});}
+    persist();renderBasket();toast('Adicionado: '+s.name);
+  }
+  function renderBasket(){
+    $('basket-items').replaceChildren();$('empty-basket').hidden=!!draft.items.length;
+    for(const item of draft.items){
+      const card=element('div','basket-item'),head=element('div','basket-item-head'),remove=element('button','remove','×');remove.setAttribute('aria-label',`Remover ${item.name}`);
+      remove.addEventListener('click',()=>{draft.items=draft.items.filter(i=>i.id!==item.id);persist();renderBasket();});head.append(element('strong','',item.name),remove);
+      const foot=element('div','basket-item-foot'),stepper=element('div','stepper');
+      for(const [label,delta] of [['−',-1],['+',1]]){
+        const b=element('button','',label);b.setAttribute('aria-label',`${delta>0?'Aumentar':'Diminuir'} ${item.name}`);b.disabled=delta<0?item.quantity<=1:item.quantity>=99;
+        b.addEventListener('click',()=>{if(delta>0&&firstVisit(item)){openService({...services.find(s=>s.id===item.id),...item},'edit');editing.quantity=item.quantity+1;return;}item.quantity+=delta;persist();renderBasket();});if(delta>0)stepper.append(element('span','',item.quantity));stepper.append(b);
+      }
+      const edit=element('button','unit-edit',item.price==null?'Definir preço':money(item.price)+' / un.');edit.addEventListener('click',()=>openService({...services.find(s=>s.id===item.id),...item},'edit'));
+      foot.append(stepper,edit,element('span','item-sum',item.price==null?'—':money(item.price*item.quantity)));card.append(head,foot);$('basket-items').append(card);
+    }
+    const count=draft.items.reduce((n,i)=>n+i.quantity,0);$('item-count').textContent=draft.items.length;$('mobile-count').textContent=count;
+    $('breakdown').replaceChildren();let result=null;
+    try{result=Quote.calculate(draft);$('calculation-note').textContent=result.minimumAdjustment?'O mínimo foi aplicado uma vez ao conjunto dos serviços.':'Confira o escopo antes de enviar ao cliente.';}
+    catch(e){$('calculation-note').textContent=draft.items.length?e.message:'Seu total será calculado ao adicionar os serviços.';}
+    if(result)for(const [key,label] of [['subtotal','Serviços'],['minimumAdjustment','Complemento do mínimo'],['surcharge','Adicional'],['materials','Materiais'],['travel','Deslocamento'],['discount','Desconto']]){
+      if(!result[key])continue;const row=element('div','break-row');row.append(element('span','',label),element('span','',Quote.money(result[key]*(key==='discount'?-1:1))));$('breakdown').append(row);
+    }
+    const amount=result?Quote.money(result.total):draft.items.length?'Defina os preços':money(0);$('total').textContent=amount;$('mobile-amount').textContent=amount+' →';
+    $('review-open').disabled=!result;$('save-quick').disabled=!draft.items.length;
+    if($('review-dialog').open)renderMessage();
+  }
+  function openService(s,mode){
+    editing={service:s,mode};$('service-title').textContent=mode==='rate'?'Seu preço':mode==='edit'?'Ajustar serviço':'Adicionar serviço';
+    $('service-name').value=s.name||'';$('service-price').value=mode==='edit'?(s.price??''):(price(s)??'');
+    $('service-scope').textContent=s.scope||'Descreva o serviço que será feito.';
+    $('service-reference').textContent=s.low!=null?`Referência piloto: ${money(s.low)} a ${money(s.high)}. Confira acesso, tempo e materiais.`:'Defina o preço após avaliar o trabalho.';
+    if(firstVisit(s))$('service-reference').textContent+=' Esta faixa é de primeiro atendimento. Para vários pontos, defina aqui o valor por unidade do conjunto; não repita automaticamente o custo de saída.';
+    $('save-price').checked=mode==='rate';$('save-price').disabled=!/^S\d{3}$/.test(s.id);$('service-submit').textContent=mode==='rate'?'Salvar meu preço':mode==='edit'?'Aplicar alteração':'Adicionar ao orçamento';
+    $('service-dialog').showModal();$('service-price').focus();
+  }
+  $('service-form').addEventListener('submit',e=>{
+    e.preventDefault();if(!$('service-form').reportValidity())return;
+    const value=Number($('service-price').value),{service:s,mode}=editing;
+    if($('save-price').checked&&!$('save-price').disabled)Workspace.updateRate(workspace,s.id,value);
+    if(mode==='edit'){const i=draft.items.find(i=>i.id===s.id);i.price=value;i.name=$('service-name').value;if(editing.quantity)i.quantity=editing.quantity;}
+    if(mode==='add')addItem({...s,name:$('service-name').value},value);
+    $('service-dialog').close();persist();renderBasket();renderCards();renderPrices();if(mode==='rate')toast('Seu preço foi salvo para os próximos orçamentos.');
+  });
+  $('custom-open').addEventListener('click',()=>openService({id:'custom-'+crypto.randomUUID(),name:'',scope:'Serviço personalizado',low:null},'add'));
+  $('search').addEventListener('input',renderCards);
+  $('mobile-total').addEventListener('click',()=>$('basket').classList.add('open'));
+  $('close-basket').addEventListener('click',()=>$('basket').classList.remove('open'));
+  function newQuote(){if(draft.items.length&&!confirm('Iniciar outro orçamento? Guarde o atual em Meus orçamentos se quiser retomá-lo.'))return;draft=blank();activeId=null;persist();renderBasket();setView('builder');}
+  $('new-quote').addEventListener('click',newQuote);$('fresh').addEventListener('click',newQuote);
+  $('paste-open').addEventListener('click',()=>$('paste-dialog').showModal());
+  $('import-request').addEventListener('click',()=>{
+    try{
+      const text=$('request-text').value,incoming=Quote.parseRequest(text,services);
+      const next=Quote.validateDraft(draft);
+      for(const item of incoming){const s=services.find(s=>s.id===item.id);const old=next.items.find(i=>i.id===item.id);if(old){if(old.quantity+item.quantity>99)throw new Error('Limite de 99 unidades por serviço.');old.quantity+=item.quantity;}else next.items.push({...item,price:firstVisit(s)&&item.quantity>1?null:price(s)});}
+      const bairro=text.match(/^Bairro:\s*(.+?)\.?$/m);if(bairro)draft.location=bairro[1];
+      if(next.items.length>200)throw new Error('Limite de itens excedido.');
+      next.location=draft.location;draft=next;
+      persist();renderBasket();$('paste-dialog').close();toast('Pedido importado. Confira os preços e as quantidades.');
+    }catch(e){$('import-note').textContent=e.message+' Para mensagens sem referência ALT1, busque e adicione os serviços manualmente.';}
+  });
+  $('adjust-open').addEventListener('click',()=>{document.querySelectorAll('[data-adjust]').forEach(e=>e.value=draft[e.dataset.adjust]);$('adjust-error').textContent='';$('adjust-dialog').showModal();});
+  $('adjust-form').addEventListener('submit',e=>{
+    e.preventDefault();if(!$('adjust-form').reportValidity())return;
+    const next={...draft};document.querySelectorAll('[data-adjust]').forEach(e=>next[e.dataset.adjust]=e.type==='number'?Number(e.value):e.value);
+    try{if(next.items.length)Quote.calculate(next);draft=next;persist();renderBasket();$('adjust-dialog').close();}catch(error){$('adjust-error').textContent=error.message;}
+  });
+  function openReview(){
+    if(!draft.scope.trim())draft.scope='Execução dos serviços listados em pontos existentes adequados. Novos circuitos e correções não descritas serão avaliados separadamente.';
+    document.querySelectorAll('[data-field]').forEach(e=>e.value=draft[e.dataset.field]);renderMessage();$('review-dialog').showModal();
+  }
+  function renderMessage(){
+    $('message').value='';let text='';try{text=Quote.message(draft);$('review-error').textContent='Confira as condições e o destinatário antes de enviar.';}catch(e){$('review-error').textContent=e.message;}
+    $('message').value=text;$('print-text').textContent=text;for(const id of ['send-whatsapp','copy-message','print'])$(id).disabled=!text;
+  }
+  document.querySelectorAll('[data-field]').forEach(e=>e.addEventListener('input',()=>{draft[e.dataset.field]=e.value;persist();renderMessage();}));
+  $('review-open').addEventListener('click',openReview);
+  async function saveQuote(status='rascunho'){activeId=Workspace.updateQuote(workspace,draft,activeId,status);await flush();renderSaved();toast('Orçamento guardado neste aparelho.');queueSync();}
+  $('save-quick').addEventListener('click',()=>saveQuote().catch(e=>toast(e.message)));
+  $('save-quote').addEventListener('click',()=>saveQuote().catch(e=>toast(e.message)));
+  $('copy-message').addEventListener('click',async()=>{try{await Native.request('copy',{text:Quote.message(draft)});toast('Mensagem copiada. Cole na conversa do cliente.');}catch(e){toast(e.message);}});
+  $('send-whatsapp').addEventListener('click',async()=>{try{const text=Quote.message(draft),url=Quote.whatsappUrl(draft.phone,text);await saveQuote('preparado');await Native.request('whatsapp',{url});}catch(e){toast(e.message);}});
+  $('print').addEventListener('click',async()=>{try{$('print-text').textContent=Quote.message(draft);await Native.request('print');}catch(e){toast(e.message);}});
+  function renderSaved(){
+    const term=normalize($('saved-search').value);$('saved-list').replaceChildren();
+    const filtered=workspace.quotes.filter(q=>normalize(q.draft.client+' '+q.draft.reference).includes(term));
+    for(const q of filtered){
+      const card=element('article','saved-card');card.append(element('p','eyebrow',q.status.toUpperCase()),element('h3','',q.draft.client||'Cliente a definir'),element('p','',q.draft.reference+' · '+(q.draft.location||'Local a definir')));
+      let value='Preço a definir';try{value=Quote.money(Quote.calculate(q.draft).total);}catch{}
+      card.append(element('div','amount',value));const actions=element('div','saved-actions');
+      for(const [label,duplicate] of [['Abrir orçamento',false],['Usar como modelo',true]]){const b=element('button','secondary',label);b.addEventListener('click',()=>{
+        if(draft.items.length&&!confirm('Abrir este orçamento? Guarde o rascunho atual se quiser mantê-lo.'))return;
+        draft=Quote.validateDraft(q.draft);activeId=duplicate?null:q.id;if(duplicate){const fresh=blank();for(const key of ['client','phone','location','reference'])draft[key]=fresh[key];}
+        persist();renderBasket();setView('builder');
+      });actions.append(b);}
+      card.append(actions);$('saved-list').append(card);
+    }
+    if(!filtered.length)$('saved-list').append(element('div','empty-state','Seus orçamentos salvos aparecerão aqui. Monte o primeiro e toque em Salvar rascunho.'));
+  }
+  $('saved-search').addEventListener('input',renderSaved);
+  function renderPrices(){
+    const term=normalize($('price-search').value);$('price-list').replaceChildren();
+    for(const s of services.filter(s=>normalize(s.name+' '+s.category).includes(term))){
+      const row=element('div','price-row'),left=element('div');left.append(element('strong','',s.name),element('small','',workspace.rates[s.id]?'Seu preço salvo':s.low!=null?'Referência piloto · confirme as condições':'Ainda sem preço definido'));
+      const b=element('button','secondary','Ajustar');b.addEventListener('click',()=>openService(s,'rate'));row.append(left,element('span','',price(s)==null?'—':money(price(s))),b);$('price-list').append(row);
+    }
+  }
+  $('price-search').addEventListener('input',renderPrices);
+  async function backup(){if(draft.items.length)await saveQuote(workspace.quotes.find(q=>q.id===activeId)?.status||'rascunho');await flush();const result=await Native.request('export',{text:JSON.stringify(state(),null,2)});if(result?.ok)toast('Backup exportado. Inclui o orçamento atual e seus preços. Guarde em local privado.');}
+  async function restore(){
+    try{const raw=await Native.request('import');if(!raw)return;const incoming=JSON.parse(raw);
+      if(incoming.version===1&&incoming.items){draft=Quote.validateDraft(incoming);activeId=null;persist();renderBasket();setView('builder');toast('Rascunho da central anterior importado.');return;}
+      const imported=Workspace.validate(incoming.workspace||incoming);
+      if(incoming.active?.draft?.items?.length){const active=Quote.validateDraft(incoming.active.draft),existing=imported.quotes.find(q=>q.id===incoming.active.id);if(!existing||JSON.stringify(existing.draft)!==JSON.stringify(active))Workspace.updateQuote(imported,active,existing?.id||null,existing?.status||'rascunho');}
+      const merged=Workspace.merge(workspace,imported);workspace=merged.data;await flush();renderSaved();renderCards();renderPrices();
+      $('transfer-result').textContent=merged.conflicts.length?merged.conflicts.join('\n'):'Orçamentos e preços importados. Acesse Meus orçamentos para abrir os registros.';$('transfer-result-dialog').showModal();
+    }catch(e){toast(e.message);}
+  }
+  $('backup').addEventListener('click',()=>backup().catch(e=>toast(e.message)));$('backup-dialog').addEventListener('click',()=>backup().catch(e=>toast(e.message)));
+  $('restore').addEventListener('click',e=>{e.preventDefault();restore();});$('restore-dialog').addEventListener('click',restore);
+  document.querySelectorAll('.sync-open').forEach(b=>b.addEventListener('click',()=>$('sync-dialog').showModal()));
+  document.addEventListener('keydown',e=>{if(e.key==='/'&&!['INPUT','TEXTAREA'].includes(document.activeElement.tagName)){e.preventDefault();setView('builder');$('search').focus();}});
+  let syncTimer=null,syncing=false,entityEditing=null;
+  const cloud=(action,values={})=>Native.request('cloud',{action,values});
+  function queueSync(){clearTimeout(syncTimer);syncTimer=setTimeout(()=>synchronize(false),1800);}
+  async function synchronize(manual=true){
+    if(!loaded||syncing)return;syncing=true;
+    try{
+      const status=await cloud('status');if(!status?.signedIn){if(manual){await openAccount();toast('Entre na sua conta para sincronizar.');}return;}
+      await flush();$('sync-state').textContent='Sincronizando…';
+      const result=await Sync.exchange(workspace,cloud);
+      const merged=Workspace.merge(workspace,result.data);
+      const before=workspace.quotes.find(q=>q.id===activeId),after=merged.data.quotes.find(q=>q.id===activeId);
+      if(before&&after&&before.rev!==after.rev&&JSON.stringify(draft)!==JSON.stringify(after.draft)){
+        activeId=null;draft.reference+=' (rascunho local '+crypto.randomUUID().slice(0,6)+')';
+        merged.conflicts.push('O orçamento aberto mudou em outro aparelho. Seu rascunho foi mantido separado; confira Meus orçamentos antes de enviar.');
+      }
+      workspace=merged.data;
+      // Referências atualizadas só afetam novos itens, nunca o orçamento existente.
+      for(const row of result.catalog||[]){const s=services.find(x=>x.id===row.id);if(s){s.low=row.reference_low==null?null:Number(row.reference_low);s.high=row.reference_high==null?null:Number(row.reference_high);s.scope=row.evidence?.['Escopo e condições']||s.scope;s.pricingBasis=row.pricing_basis;}}
+      await flush();renderCards();renderPrices();renderSaved();renderEntities();
+      $('sync-state').textContent='Sincronizado às '+new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+      const conflicts=[...new Set([...result.conflicts,...merged.conflicts])];if(conflicts.length){$('transfer-result').textContent=conflicts.join('\n');$('transfer-result-dialog').showModal();}else if(manual)toast('Dados sincronizados com segurança.');
+    }catch(e){$('sync-state').textContent='Salvo localmente · sincronização pendente';if(manual)toast(e.message);}
+    finally{syncing=false;}
+  }
+  $('sync-now').addEventListener('click',()=>synchronize(true));
+  setInterval(()=>synchronize(false),45000);
+  window.addEventListener('online',()=>queueSync());
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden)queueSync();});
+  async function openAccount(){
+    if(!$('account-dialog').open)$('account-dialog').showModal();
+    $('login-form').hidden=false;
+    try{const s=await cloud('status');$('account-status').textContent=s.signedIn?'Sessão salva: '+s.email+'. Você pode entrar novamente abaixo.':s.configured?'Conexão configurada. Entre com seu e-mail e senha.':'Configure a chave publicável e entre com seu e-mail e senha.';$('connection-settings').open=!s.configured;$('cloud-logout').hidden=!s.signedIn;if(!$('cloud-email').value&&s.email)$('cloud-email').value=s.email;}catch(e){$('account-status').textContent=e.message;}
+  }
+  document.querySelectorAll('.account-open').forEach(b=>b.addEventListener('click',openAccount));
+  $('account-dialog').addEventListener('close',()=>{$('cloud-key').value='';$('cloud-password').value='';});
+  $('cloud-configure').addEventListener('click',async()=>{const key=$('cloud-key').value.trim();$('cloud-key').value='';try{await cloud('configure',{key});await openAccount();}catch(e){$('account-status').textContent=e.message;}});
+  $('login-form').addEventListener('submit',async e=>{e.preventDefault();const button=$('login-form').querySelector('button'),password=$('cloud-password').value;$('cloud-password').value='';button.disabled=true;try{await cloud('login',{email:$('cloud-email').value.trim(),password});await openAccount();await checkAccess();}catch(error){$('account-status').textContent=error.message;}finally{button.disabled=false;}});
+  async function checkAccess(){try{const a=await cloud('access');$('access-info').textContent=a.authorized?'Conectado. Sincronização disponível.':'Esta conta não tem acesso aos dados da ALTIMAX.';if(a.authorized){$('account-status').textContent='Conectado com e-mail e senha.';queueSync();}}catch(e){$('access-info').textContent=e.message;}}
+  $('access-check').addEventListener('click',checkAccess);
+  $('cloud-logout').addEventListener('click',async()=>{try{await cloud('logout');$('access-info').textContent='';await openAccount();}catch(e){$('account-status').textContent=e.message;}});
+  const labels={name:'Nome',phone:'WhatsApp / telefone',email:'E-mail',address:'Endereço e bairro',notes:'Observações',title:'Descrição',quoteId:'Orçamento relacionado',clientId:'Cliente relacionado',date:'Data / horário',findings:'O que foi observado',workDone:'Serviços executados',recommendations:'Recomendações / pendências',status:'Situação',amount:'Valor recebido (R$)',method:'Forma de pagamento',value:'Conteúdo'};
+  function renderEntities(){
+    const key=$('entity-kind').value,term=normalize($('entity-search').value);$('entity-list').replaceChildren();
+    for(const e of workspace[key].filter(e=>!e.deleted&&normalize(JSON.stringify(e)).includes(term))){
+      const card=element('article','saved-card');card.append(element('h3','',e.name||e.title||'Registro'),element('p','',key==='clients'?[e.phone,e.address].filter(Boolean).join(' · '):[e.date,e.status,e.amount?money(Number(e.amount)):''].filter(Boolean).join(' · ')));
+      const buttons=element('div','saved-actions'),edit=element('button','secondary','Abrir / editar');edit.addEventListener('click',()=>openEntity(e));buttons.append(edit);
+      if(key==='clients'){const b=element('button','secondary','Usar no orçamento');b.addEventListener('click',()=>{draft.client=e.name;draft.phone=e.phone;draft.location=e.address;persist();setView('builder');toast('Cliente selecionado para o orçamento atual.');});buttons.append(b);}
+      if(key==='reports'){const b=element('button','secondary','Copiar relatório');b.addEventListener('click',async()=>{try{await Native.request('copy',{text:'RELATÓRIO DE ATENDIMENTO · ALTIMAX\n'+Workspace.entities.reports.map(f=>labels[f]+': '+e[f]).join('\n\n')});toast('Relatório copiado.');}catch(error){toast(error.message);}});buttons.append(b);}
+      const archive=element('button','text-button','Arquivar');archive.addEventListener('click',()=>{if(confirm('Arquivar este registro nos aparelhos sincronizados?')){Workspace.updateEntity(workspace,key,{...e,deleted:true},e.id);persist();renderEntities();}});buttons.append(archive);card.append(buttons);$('entity-list').append(card);
+    }
+    if(!$('entity-list').children.length)$('entity-list').append(element('p','empty-state','Nenhum registro encontrado. Toque em Novo registro para começar.'));
+  }
+  function openEntity(entry=null){
+    const key=$('entity-kind').value;entityEditing=entry?.id||null;$('entity-fields').replaceChildren();$('entity-error').textContent='';$('entity-title').textContent=entry?'Editar registro':'Novo registro';
+    for(const f of Workspace.entities[key]){
+      const label=element('label','',labels[f]);let input;
+      if(f==='clientId'||f==='quoteId'){
+        input=element('select');const blank=element('option','','Sem vínculo');blank.value='';input.append(blank);
+        for(const r of f==='clientId'?workspace.clients.filter(c=>!c.deleted):workspace.quotes){const o=element('option','',r.name||r.draft.reference+' · '+r.draft.client);o.value=r.id;input.append(o);}
+        if(entry?.[f]&&!Array.from(input.options).some(o=>o.value===entry[f])){const o=element('option','','Vínculo anterior: '+entry[f]);o.value=entry[f];input.append(o);}
+      }else{input=element(['notes','findings','workDone','recommendations','value'].includes(f)?'textarea':'input');input.maxLength=5000;if(f==='amount'){input.type='number';input.min='0';input.max='1000000';input.step='0.01';}if(f==='email')input.type='email';if(f==='phone')input.type='tel';}
+      input.dataset.entityField=f;input.value=entry?.[f]||'';input.required=['name','title','amount'].includes(f);label.append(input);$('entity-fields').append(label);
+    }
+    $('entity-dialog').showModal();
+  }
+  $('entity-new').addEventListener('click',()=>openEntity());$('entity-kind').addEventListener('change',renderEntities);$('entity-search').addEventListener('input',renderEntities);
+  $('entity-form').addEventListener('submit',e=>{e.preventDefault();try{const fields={deleted:false};document.querySelectorAll('[data-entity-field]').forEach(input=>fields[input.dataset.entityField]=input.value.trim());Workspace.updateEntity(workspace,$('entity-kind').value,fields,entityEditing);persist();renderEntities();$('entity-dialog').close();toast('Registro salvo neste aparelho.');}catch(error){$('entity-error').textContent=error.message;}});
+
+  try{
+    const result=await Native.request('load');platform=result.platform;
+    if(result.state){workspace=Workspace.validate(result.state.workspace);if(result.state.active?.draft){draft=Quote.validateDraft(result.state.active.draft);activeId=result.state.active.id;}}
+    loaded=true;queueSync();renderCategories();renderCards();renderBasket();renderSaved();renderPrices();
+  }catch(e){toast(e.message);$('sync-state').textContent='Não foi possível abrir os dados';renderCategories();renderCards();renderBasket();}
+})();
+'use strict';
+// Todos os valores monetários são calculados em centavos.
+const Quote = (() => {
+  const money = value => new Intl.NumberFormat('pt-BR',{style:'currency',currency:'BRL'}).format(value/100);
+  function number(value, label, max=1000000) {
+    if (value === '' || value == null || typeof value === 'boolean') throw new Error(`Preencha ${label}.`);
+    const n=Number(value);
+    if (!Number.isFinite(n) || n<0 || n>max) throw new Error(`Valor inválido: ${label}.`);
+    return n;
+  }
+  const cents = (value,label) => Math.round(number(value,label)*100);
+  function calculate(draft) {
+    if (!draft.items.length) throw new Error('Adicione ao menos um serviço.');
+    let subtotal=0;
+    for (const item of draft.items) {
+      const quantity=number(item.quantity,'quantidade',99);
+      if (!Number.isInteger(quantity) || quantity<1) throw new Error('Quantidade deve ser de 1 a 99.');
+      if (!item.name.trim()) throw new Error('Dê um nome ao serviço.');
+      const price=cents(item.price,`preço de ${item.name}`);
+      if (!price) throw new Error(`Defina um preço maior que zero para ${item.name}.`);
+      subtotal+=price*quantity;
+    }
+    const minimum=cents(draft.minimum,'mínimo'), minimumAdjustment=Math.max(0,minimum-subtotal);
+    const labor=subtotal+minimumAdjustment;
+    const surcharge=Math.round(labor*number(draft.percent,'adicional percentual',100)/100);
+    const materials=cents(draft.materials,'materiais'), travel=cents(draft.travel,'deslocamento'), discount=cents(draft.discount,'desconto');
+    if (discount>labor+surcharge) throw new Error('O desconto não pode superar a mão de obra com adicional.');
+    if (draft.percent>0 && !draft.surchargeReason.trim()) throw new Error('Descreva o motivo do adicional.');
+    const total=labor+surcharge+materials+travel-discount;
+    if (total<=0) throw new Error('O total deve ser maior que zero.');
+    return {subtotal,minimumAdjustment,labor,surcharge,materials,travel,discount,total};
+  }
+  function message(draft) {
+    const r=calculate(draft);
+    if (!draft.client.trim() || !draft.location.trim() || !draft.scope.trim() || !draft.validity.trim()) throw new Error('Preencha cliente, local, escopo e validade antes de enviar.');
+    const lines=[`${draft.kind} · ALTIMAX Elétrica`, `Referência: ${draft.reference}`, `Cliente: ${draft.client}`,`Local: ${draft.location}`, '', 'Serviços:'];
+    draft.items.forEach(i=>lines.push(`• ${i.quantity} × ${i.name} — ${money(cents(i.price,'preço')*i.quantity)}`));
+    if(r.minimumAdjustment)lines.push(`Complemento de atendimento mínimo: ${money(r.minimumAdjustment)}`);
+    if(r.surcharge)lines.push(`Adicional (${draft.surchargeReason}): ${money(r.surcharge)}`);
+    lines.push(r.materials ? `Materiais incluídos no total: ${money(r.materials)}` : 'Materiais: fornecidos pelo cliente; não incluídos no valor.');
+    if(r.travel)lines.push(`Deslocamento: ${money(r.travel)}`);
+    if(r.discount)lines.push(`Desconto: ${money(r.discount)}`);
+    lines.push('',`TOTAL: ${money(r.total)}`,'',`Escopo: ${draft.scope}`,`Pagamento: ${draft.payment}`,`Validade: ${draft.validity}`,`Agendamento: ${draft.schedule}`);
+    if(draft.notes.trim())lines.push(`Observações: ${draft.notes}`);
+    if(draft.kind==='Pré-orçamento')lines.push('Estimativa para o escopo descrito. Condições da instalação serão confirmadas antes de fechar o orçamento.');
+    lines.push('Qualquer serviço adicional será combinado antes da execução.','', 'Marcello Almeida · (21) 98453-2692','Engenheiro Eletricista · RNP 2022776690 · CREA-RJ');
+    return lines.join('\n');
+  }
+  function parseRequest(text, services) {
+    const match=String(text).match(/ALT1:([^\s]+)/);
+    if (!match) throw new Error('Cole a mensagem com a referência ALT1 recebida do site.');
+    const tokens=match[1].split(',');
+    if(tokens.length>services.length)throw new Error('Pedido muito extenso.');
+    const seen=new Set();
+    return tokens.map(token=>{
+      const m=token.match(/^(S\d{3})x([1-9]\d?)$/);
+      const service=m && services.find(s=>s.id===m[1]);
+      if(!service || seen.has(service.id))throw new Error('Referência inválida ou serviço repetido.');
+      seen.add(service.id);
+      return {id:service.id,name:service.name,quantity:Number(m[2]),price:null};
+    });
+  }
+  function validateDraft(value) {
+    if(!value || value.version!==1 || !Array.isArray(value.items) || value.items.length>200)throw new Error('Arquivo de rascunho inválido.');
+    const clean={version:1};
+    for(const key of ['client','location','phone','reference','kind','scope','validity','schedule','payment','notes','surchargeReason']){
+      if(typeof value[key]!=='string' || value[key].length>5000)throw new Error(`Campo inválido: ${key}.`);
+      clean[key]=value[key];
+    }
+    if(!['Pré-orçamento','Orçamento'].includes(clean.kind))throw new Error('Tipo de orçamento inválido.');
+    for(const key of ['minimum','percent','materials','travel','discount'])clean[key]=number(value[key],key,key==='percent'?100:1000000);
+    const ids=new Set();
+    clean.items=value.items.map(i=>{
+      if(!i || typeof i.id!=='string' || typeof i.name!=='string' || !i.name.trim() || i.name.length>500 || !/^[\w-]{1,80}$/.test(i.id) || ids.has(i.id))throw new Error('Item de rascunho inválido.');
+      ids.add(i.id);
+      const quantity=number(i.quantity,'quantidade',99);
+      if(!Number.isInteger(quantity)||quantity<1)throw new Error('Quantidade inválida.');
+      return {id:i.id,name:i.name,quantity,price:i.price==null || i.price==='' ? null : number(i.price,'preço')};
+    });
+    return clean;
+  }
+  function whatsappUrl(phone,text) {
+    let digits=String(phone).replace(/\D/g,'');
+    if(digits.length===10 || digits.length===11)digits='55'+digits;
+    if(!/^55[1-9]\d{9,10}$/.test(digits))throw new Error('Informe o WhatsApp do cliente com DDD (10 ou 11 dígitos).');
+    return `https://wa.me/${digits}?text=${encodeURIComponent(text)}`;
+  }
+  return {money,calculate,message,parseRequest,validateDraft,whatsappUrl};
+})();
+if(typeof module!=='undefined')module.exports=Quote;
+:root{--green:#173f35;--deep:#10332a;--accent:#efad52;--paper:#f5f6f2;--white:#fff;--ink:#233a31;--muted:#6f7d74;--line:#e1e7df;--soft:#edf2ea;--red:#a33929}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.55 'Segoe UI',Arial,sans-serif}button,input,select,textarea{font:inherit}button{cursor:pointer}button:disabled{opacity:.4;cursor:not-allowed}button,a,input,textarea,select,summary{-webkit-tap-highlight-color:transparent}button:focus-visible,a:focus-visible,input:focus,textarea:focus,select:focus{outline:3px solid #efad5260;outline-offset:2px}button{border:0}input,textarea,select{width:100%;min-width:0;border:1px solid #cad5c8;border-radius:8px;background:#fff;color:var(--ink);padding:12px 13px;margin:7px 0 12px}input[type=checkbox]{width:18px;height:18px;margin:0;accent-color:var(--green)}label{font-size:12px;font-weight:650;display:block}.check{display:flex;align-items:center;gap:10px;font-weight:400;margin:16px 0}textarea{resize:vertical}h1,h2,h3,p{margin-top:0}h2{font-size:20px;letter-spacing:-.4px}h3{font-size:15px}.eyebrow{font-size:10px;font-weight:750;letter-spacing:1.5px;color:var(--muted);margin:0 0 8px}.hint{color:var(--muted);font-size:11px;line-height:1.6}.primary,.secondary{display:inline-flex;align-items:center;justify-content:center;gap:12px;padding:13px 18px;min-height:44px;border-radius:8px;font-size:12px;font-weight:650;line-height:1.35}.primary{background:var(--green);color:white}.primary>span{margin-left:auto;font-size:19px}.primary:hover{background:#245c4a}.secondary{background:transparent;border:1px solid #ccd7c9;color:var(--green)}.secondary:hover{background:var(--soft)}.text-button{background:none;color:var(--muted);font-size:12px;padding:8px 0;text-align:left}.icon-button{background:transparent;color:var(--ink);font-size:25px;width:36px;height:36px;border-radius:8px}.sidebar{width:228px;position:fixed;inset:0 auto 0 0;display:flex;flex-direction:column;background:var(--green);color:white;padding:32px 18px;z-index:5}.wordmark{display:flex;align-items:center;gap:10px;color:white;text-decoration:none;padding:0 12px}.wordmark>span{font-weight:800;letter-spacing:2px;line-height:1.3;font-size:18px}.wordmark small{display:block;font-size:8px;font-weight:500;letter-spacing:2px;color:#c4d4c9}.sidebar nav{margin-top:48px;display:grid;gap:9px}.nav-button{padding:14px 16px;display:flex;align-items:center;gap:13px;border-radius:7px;text-align:left;background:transparent;color:#d1e0d5;font-size:12px;font-weight:550}.nav-button>span{font-size:20px}.nav-button.active{background:#31554a;color:#fff}.sidebar-bottom{margin-top:auto;padding:16px 12px 0;display:grid;gap:5px}.sidebar-bottom .text-button{color:#bfd2c6;font-size:11px}.sidebar-bottom small{margin-top:22px;color:#bfd2c6;font-size:11px;line-height:1.8}.sidebar-bottom .hint{color:#bfd2c6}.file-button{cursor:pointer}.file-button input{display:none}.main-shell{margin-left:228px}.topbar{height:77px;border-bottom:1px solid var(--line);padding:0 35px;display:flex;align-items:center;justify-content:space-between;background:#fbfcf9;gap:16px}.desktop-caption{font-size:9px;letter-spacing:1.6px;font-weight:650;color:var(--muted)}.connection{display:flex;align-items:center;gap:12px;font-size:10px;color:var(--muted)}.connection>.secondary{min-height:32px;padding:6px 10px;font-size:10px}.mobile-brand{display:none}main{padding:36px;max-width:1650px;margin:auto}.page-heading{display:flex;align-items:center;justify-content:space-between;gap:24px;margin-bottom:30px}.page-heading h1{font-size:32px;line-height:1.2;letter-spacing:-1.2px;font-weight:650;margin:8px 0 12px}.page-heading h1>span{color:var(--accent)}.page-heading p:not(.eyebrow){color:var(--muted);font-size:12px;margin-bottom:0}.page-heading>.secondary{font-size:11px;background:white;white-space:nowrap}.builder-grid{display:grid;grid-template-columns:minmax(0,1fr) 350px;gap:28px;align-items:start}.search-box{display:flex;align-items:center;background:white;border:1px solid #d4ddcf;border-radius:10px;padding:0 16px;gap:12px;box-shadow:0 4px 12px #16372b03}.search-box>span{font-size:28px;color:var(--muted)}.search-box input{border:0;background:transparent;padding:17px 0;margin:0;font-size:12px;outline:none}.search-box kbd{border:1px solid var(--line);color:#9ba89c;padding:0 6px;border-radius:4px}.chips{display:flex;gap:7px;overflow:auto;padding:17px 0 13px;scrollbar-width:thin}.chip{white-space:nowrap;border:1px solid var(--line);background:white;color:var(--muted);padding:8px 13px;border-radius:30px;font-size:10px;flex-shrink:0}.chip.active{background:var(--green);color:white;border-color:var(--green)}.catalog-heading{display:flex;align-items:center;justify-content:space-between;margin:15px 0}.catalog-heading h2{font-size:16px;margin:0}.catalog-heading>span{font-size:10px;color:var(--muted)}.cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:13px}.service-card{background:white;border:1px solid var(--line);border-radius:11px;padding:18px;display:flex;flex-direction:column;min-height:196px;transition:border-color .15s,transform .15s}.service-card:hover{border-color:#94ae92;transform:translateY(-1px)}.card-top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:13px}.service-symbol{width:34px;height:34px;background:#eff3e8;color:var(--green);border-radius:9px;display:grid;place-items:center;font-size:18px}.category-tag{font-size:9px;color:var(--muted);text-align:right}.service-card h3{font-size:13px;line-height:1.45;margin:0 0 14px;font-weight:650;max-width:250px}.card-bottom{display:flex;justify-content:space-between;align-items:end;gap:10px;margin-top:auto}.card-price{font-size:19px;line-height:1.4;letter-spacing:-.5px;font-weight:650}.card-price small{display:block;font-size:9px;color:var(--muted);letter-spacing:0;font-weight:400}.card-add{background:var(--green);color:white;width:36px;height:36px;flex-shrink:0;border-radius:8px;font-size:24px}.card-add:hover{background:#2c664f}.card-price.undefined{font-size:12px;letter-spacing:0}.add-custom{display:block;width:100%;margin-top:16px;padding:14px;border:1px dashed #b1c3ac;border-radius:9px;color:var(--green);background:transparent;font-size:11px;font-weight:600}.catalog-note{font-size:10px;color:var(--muted);margin:14px 2px}.basket{position:sticky;top:22px;background:white;border:1px solid var(--line);border-radius:12px;padding:23px;box-shadow:0 12px 40px #12382706}.basket-heading{display:flex;justify-content:space-between;align-items:center;padding-bottom:18px;border-bottom:1px solid var(--line);gap:10px}.basket-heading h2{font-size:18px;margin:0}.basket-heading .eyebrow{font-size:8px}.basket-heading h2 span{display:inline-block;padding:2px 6px;background:var(--soft);color:var(--muted);border-radius:5px;font-size:10px;vertical-align:middle}.basket-heading>.text-button{font-size:10px}#empty-basket{text-align:center;padding:42px 0 28px}.empty-icon{font-size:25px;background:var(--soft);color:#9bb298;border-radius:50%;width:52px;height:52px;display:grid;place-items:center;margin:0 auto 16px}#empty-basket h3{font-size:14px;margin-bottom:6px}#empty-basket p{font-size:11px;color:var(--muted)}.basket-item{padding:17px 0;border-bottom:1px solid var(--line)}.basket-item-head{display:flex;align-items:start;gap:10px}.basket-item-head strong{flex:1;font-size:12px;line-height:1.5}.remove{background:none;color:#8c9990;font-size:18px;padding:0 2px}.basket-item-foot{display:flex;align-items:center;gap:10px;justify-content:space-between;margin-top:12px}.stepper{display:flex;align-items:center;border:1px solid var(--line);border-radius:7px;overflow:hidden}.stepper button{background:var(--paper);width:30px;height:30px;color:var(--green);font-size:17px}.stepper span{min-width:26px;text-align:center;font-size:11px}.unit-edit{background:transparent;font-size:11px;color:var(--green);text-decoration:underline;padding:4px}.item-sum{font-size:12px;font-weight:650}.adjust-button{margin:19px 0 14px;background:var(--soft);color:var(--green);border-radius:7px;padding:12px 8px;font-size:10px;width:100%;font-weight:550}.break-row{display:flex;justify-content:space-between;color:var(--muted);font-size:10px;margin:7px 0}.grand-total{border-top:1px solid var(--line);padding:19px 0 9px;margin-top:12px;display:flex;justify-content:space-between;align-items:center;gap:10px}.grand-total>span{font-size:11px}.grand-total>strong{font-size:25px;letter-spacing:-.7px}.basket>.primary,.basket>.secondary{width:100%;margin:6px 0}.basket>.primary{background:var(--accent);color:var(--green)}.basket>.hint{font-size:9px;margin:5px 0 10px}.wide-search{max-width:520px;margin-bottom:26px}.saved-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.saved-card{background:white;border:1px solid var(--line);border-radius:10px;padding:24px}.saved-card h3{font-size:17px;margin-bottom:4px}.saved-card p{font-size:11px;color:var(--muted)}.saved-card .amount{font-size:25px;font-weight:650;margin-bottom:20px}.saved-actions{display:flex;gap:10px;flex-wrap:wrap}.price-list{background:white;border:1px solid var(--line);border-radius:12px}.price-row{padding:17px 22px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:20px}.price-row:last-child{border-bottom:0}.price-row>div{flex:1;min-width:0}.price-row strong{display:block;font-size:12px}.price-row small{color:var(--muted);font-size:10px}.price-row>span{font-size:15px;white-space:nowrap}.price-row button{white-space:nowrap}.empty-state{padding:50px;text-align:center;color:var(--muted);font-size:13px}.toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%);max-width:90%;background:var(--green);color:white;border:1px solid #748f78;border-radius:10px;padding:14px 22px;box-shadow:0 6px 30px #173f3520;z-index:1000;font-size:12px;white-space:pre-line}dialog{border:1px solid var(--line);border-radius:16px;padding:28px;max-width:500px;width:calc(100% - 28px);max-height:90vh;color:var(--ink);box-shadow:0 30px 80px #0e2a2930}dialog::backdrop{background:#0b231d80;backdrop-filter:blur(3px)}.dialog-head{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:18px}.dialog-head h2{margin:0;font-size:22px}.dialog-head .icon-button{margin:-8px}.dialog-head .eyebrow{margin-bottom:6px}dialog>p{color:var(--muted);font-size:12px}dialog .primary{width:100%;margin-top:8px}dialog .secondary{margin-top:8px}dialog details{font-size:12px;margin:16px 0}dialog summary{cursor:pointer;color:var(--green)}.field-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}.large-dialog{max-width:950px}.review-grid{display:grid;grid-template-columns:1fr 1fr;gap:28px}.message-panel{background:var(--soft);padding:20px;border-radius:10px}.message-panel textarea{font-size:11px;line-height:1.6;resize:vertical;min-height:270px}.message-panel .secondary{width:100%;font-size:10px;padding:10px}.message-panel .field-grid{gap:8px}#review-error{color:var(--red)}#pair-qr{display:block;margin:16px auto;max-width:100%}#pair-key{font-family:monospace;font-size:13px;word-break:break-all}.mobile-nav,.mobile-total,.mobile-only,#print-sheet{display:none}[hidden]{display:none!important}@media(min-width:1550px){.cards{grid-template-columns:repeat(3,minmax(0,1fr))}.builder-grid{grid-template-columns:minmax(0,1fr) 385px}}@media(max-width:1180px){.sidebar{width:190px;padding-inline:10px}.main-shell{margin-left:190px}.wordmark{padding-inline:8px}.wordmark>span{font-size:15px}main{padding:28px 24px}.builder-grid{gap:18px;grid-template-columns:minmax(0,1fr) 300px}.basket{padding:18px}.page-heading{align-items:start;flex-direction:column;gap:15px}.service-card{padding:15px}.card-price{font-size:17px}}@media(max-width:900px){.sidebar{display:none}.main-shell{margin-left:0}.topbar{padding:0 20px;height:64px}.desktop-caption{display:none}.mobile-brand{display:block;font-weight:800;letter-spacing:1px}.mobile-brand small{display:block;font-size:9px;font-weight:500;letter-spacing:0;color:var(--muted)}main{padding:24px 20px 150px}.page-heading h1{font-size:30px}.builder-grid{display:block}.basket{display:none}.basket.open{display:block;position:fixed;inset:75px 10px 75px;overflow-y:auto;z-index:30;box-shadow:0 0 0 100vmax #0d281c80;padding:24px}.mobile-only{display:block}.mobile-nav{display:flex;position:fixed;bottom:0;left:0;right:0;background:white;border-top:1px solid var(--line);padding:7px 12px calc(7px + env(safe-area-inset-bottom));z-index:40;justify-content:space-around}.mobile-nav button{background:none;color:var(--muted);font-size:22px;width:25%;padding:2px 0}.mobile-nav button span{display:block;font-size:9px}.mobile-nav button.active{color:var(--green);font-weight:750}.mobile-total{display:flex;position:fixed;bottom:75px;left:16px;right:16px;border-radius:10px;padding:17px 18px;background:var(--green);color:white;justify-content:space-between;gap:12px;box-shadow:0 6px 20px #10332a30;z-index:25;font-size:11px}.mobile-total strong{font-size:15px}.toast{bottom:145px}.service-card{min-height:182px}.review-grid{grid-template-columns:1fr}.large-dialog{max-width:600px}.saved-list{grid-template-columns:1fr}}@media(max-width:450px){main{padding:20px 14px 150px}.page-heading h1{font-size:27px}.page-heading .eyebrow{font-size:8px}.page-heading p:not(.eyebrow){font-size:11px}.page-heading>.secondary{width:100%}.connection{gap:5px;font-size:8px}.connection>.secondary{padding:6px;font-size:9px}.topbar{padding:0 15px}.service-card{padding:13px;min-height:183px}.cards{gap:10px}.service-card h3{font-size:12px}.category-tag{font-size:8px}.card-price{font-size:17px}.card-price small{font-size:8px}.card-add{width:31px;height:31px}.search-box{padding:0 12px}.search-box input{font-size:11px}.price-row{padding:14px;gap:10px;flex-wrap:wrap}.price-row>div{flex-basis:60%}.price-row .secondary{padding:8px;font-size:10px}.field-grid{gap:0 10px}dialog{padding:20px}.dialog-head h2{font-size:20px}.chips{padding-block:15px}.grand-total>strong{font-size:26px}}@media print{body{background:white;color:black;font:12px/1.6 Arial,sans-serif}#app,dialog,.toast{display:none!important}#print-sheet{display:block;padding:8mm}#print-sheet pre{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:24px}@page{size:A4;margin:15mm}}
+
+
+
+
+
+
+Success
+
+
+
+
+
+
+Ran Get-Content -Encoding UTF8 central-app/public/app.js | Select-Object -Last 48
+Get-Content -Encoding UTF8 central-app/desktop/store.cjs
+Get-Content -Encoding UTF8 central-app/tests/sync.test.cjs
+Get-Content -Encoding UTF8 scripts/preparar_aplicativos.py | Select-Object -First 65
+Get-Content -Encoding UTF8 central-app/android/app/src/main/java/br/com/altimax/orcamentos/MainActivity.java | Select-String -Pattern 'save\(|load\(|validate|merge' -Context 2,5
+Shell
+$Get-Content -Encoding UTF8 central-app/public/app.js | Select-Object -Last 48
+Get-Content -Encoding UTF8 central-app/desktop/store.cjs
+Get-Content -Encoding UTF8 central-app/tests/sync.test.cjs
+Get-Content -Encoding UTF8 scripts/preparar_aplicativos.py | Select-Object -First 65
+Get-Content -Encoding UTF8 central-app/android/app/src/main/java/br/com/altimax/orcamentos/MainActivity.java | Select-String -Pattern 'save\(|load\(|validate|merge' -Context 2,5
+
+
+  window.addEventListener('online',()=>queueSync());
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden)queueSync();});
+  async function openAccount(){
+    if(!$('account-dialog').open)$('account-dialog').showModal();
+    $('login-form').hidden=false;
+    try{const s=await cloud('status');$('account-status').textContent=s.signedIn?'Sessão salva: '+s.email+'. Você pode entrar novamente abaixo.':s.configured?'Conexão configurada. Entre com seu e-mail e senha.':'Configure a chave publicável e entre com seu e-mail e senha.';$('connection-settings').open=!s.configured;$('cloud-logout').hidden=!s.signedIn;if(!$('cloud-email').value&&s.email)$('cloud-email').value=s.email;}catch(e){$('account-status').textContent=e.message;}
+  }
+  document.querySelectorAll('.account-open').forEach(b=>b.addEventListener('click',openAccount));
+  $('account-dialog').addEventListener('close',()=>{$('cloud-key').value='';$('cloud-password').value='';});
+  $('cloud-configure').addEventListener('click',async()=>{const key=$('cloud-key').value.trim();$('cloud-key').value='';try{await cloud('configure',{key});await openAccount();}catch(e){$('account-status').textContent=e.message;}});
+  $('login-form').addEventListener('submit',async e=>{e.preventDefault();const button=$('login-form').querySelector('button'),password=$('cloud-password').value;$('cloud-password').value='';button.disabled=true;try{await cloud('login',{email:$('cloud-email').value.trim(),password});await openAccount();await checkAccess();}catch(error){$('account-status').textContent=error.message;}finally{button.disabled=false;}});
+  async function checkAccess(){try{const a=await cloud('access');$('access-info').textContent=a.authorized?'Conectado. Sincronização disponível.':'Esta conta não tem acesso aos dados da ALTIMAX.';if(a.authorized){$('account-status').textContent='Conectado com e-mail e senha.';queueSync();}}catch(e){$('access-info').textContent=e.message;}}
+  $('access-check').addEventListener('click',checkAccess);
+  $('cloud-logout').addEventListener('click',async()=>{try{await cloud('logout');$('access-info').textContent='';await openAccount();}catch(e){$('account-status').textContent=e.message;}});
+  const labels={name:'Nome',phone:'WhatsApp / telefone',email:'E-mail',address:'Endereço e bairro',notes:'Observações',title:'Descrição',quoteId:'Orçamento relacionado',clientId:'Cliente relacionado',date:'Data / horário',findings:'O que foi observado',workDone:'Serviços executados',recommendations:'Recomendações / pendências',status:'Situação',amount:'Valor recebido (R$)',method:'Forma de pagamento',value:'Conteúdo'};
+  function renderEntities(){
+    const key=$('entity-kind').value,term=normalize($('entity-search').value);$('entity-list').replaceChildren();
+    for(const e of workspace[key].filter(e=>!e.deleted&&normalize(JSON.stringify(e)).includes(term))){
+      const card=element('article','saved-card');card.append(element('h3','',e.name||e.title||'Registro'),element('p','',key==='clients'?[e.phone,e.address].filter(Boolean).join(' · '):[e.date,e.status,e.amount?money(Number(e.amount)):''].filter(Boolean).join(' · ')));
+      const buttons=element('div','saved-actions'),edit=element('button','secondary','Abrir / editar');edit.addEventListener('click',()=>openEntity(e));buttons.append(edit);
+      if(key==='clients'){const b=element('button','secondary','Usar no orçamento');b.addEventListener('click',()=>{draft.client=e.name;draft.phone=e.phone;draft.location=e.address;persist();setView('builder');toast('Cliente selecionado para o orçamento atual.');});buttons.append(b);}
+      if(key==='reports'){const b=element('button','secondary','Copiar relatório');b.addEventListener('click',async()=>{try{await Native.request('copy',{text:'RELATÓRIO DE ATENDIMENTO · ALTIMAX\n'+Workspace.entities.reports.map(f=>labels[f]+': '+e[f]).join('\n\n')});toast('Relatório copiado.');}catch(error){toast(error.message);}});buttons.append(b);}
+      const archive=element('button','text-button','Arquivar');archive.addEventListener('click',()=>{if(confirm('Arquivar este registro nos aparelhos sincronizados?')){Workspace.updateEntity(workspace,key,{...e,deleted:true},e.id);persist();renderEntities();}});buttons.append(archive);card.append(buttons);$('entity-list').append(card);
+    }
+    if(!$('entity-list').children.length)$('entity-list').append(element('p','empty-state','Nenhum registro encontrado. Toque em Novo registro para começar.'));
+  }
+  function openEntity(entry=null){
+    const key=$('entity-kind').value;entityEditing=entry?.id||null;$('entity-fields').replaceChildren();$('entity-error').textContent='';$('entity-title').textContent=entry?'Editar registro':'Novo registro';
+    for(const f of Workspace.entities[key]){
+      const label=element('label','',labels[f]);let input;
+      if(f==='clientId'||f==='quoteId'){
+        input=element('select');const blank=element('option','','Sem vínculo');blank.value='';input.append(blank);
+        for(const r of f==='clientId'?workspace.clients.filter(c=>!c.deleted):workspace.quotes){const o=element('option','',r.name||r.draft.reference+' · '+r.draft.client);o.value=r.id;input.append(o);}
+        if(entry?.[f]&&!Array.from(input.options).some(o=>o.value===entry[f])){const o=element('option','','Vínculo anterior: '+entry[f]);o.value=entry[f];input.append(o);}
+      }else{input=element(['notes','findings','workDone','recommendations','value'].includes(f)?'textarea':'input');input.maxLength=5000;if(f==='amount'){input.type='number';input.min='0';input.max='1000000';input.step='0.01';}if(f==='email')input.type='email';if(f==='phone')input.type='tel';}
+      input.dataset.entityField=f;input.value=entry?.[f]||'';input.required=['name','title','amount'].includes(f);label.append(input);$('entity-fields').append(label);
+    }
+    $('entity-dialog').showModal();
+  }
+  $('entity-new').addEventListener('click',()=>openEntity());$('entity-kind').addEventListener('change',renderEntities);$('entity-search').addEventListener('input',renderEntities);
+  $('entity-form').addEventListener('submit',e=>{e.preventDefault();try{const fields={deleted:false};document.querySelectorAll('[data-entity-field]').forEach(input=>fields[input.dataset.entityField]=input.value.trim());Workspace.updateEntity(workspace,$('entity-kind').value,fields,entityEditing);persist();renderEntities();$('entity-dialog').close();toast('Registro salvo neste aparelho.');}catch(error){$('entity-error').textContent=error.message;}});
+
+  try{
+    const result=await Native.request('load');platform=result.platform;
+    if(result.state){workspace=Workspace.validate(result.state.workspace);if(result.state.active?.draft){draft=Quote.validateDraft(result.state.active.draft);activeId=result.state.active.id;}}
+    loaded=true;queueSync();renderCategories();renderCards();renderBasket();renderSaved();renderPrices();
+  }catch(e){toast(e.message);$('sync-state').textContent='Não foi possível abrir os dados';renderCategories();renderCards();renderBasket();}
+})();
+'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
+global.Quote = require('../public/quote.js');
+const Workspace = require('../public/workspace.js');
+const LIMIT = 8 * 1024 * 1024;
+let encryption=null;
+const PREFIX=Buffer.from('ALT2\0');
+function protect(crypto){encryption=crypto;}
+function decode(bytes){if(bytes.subarray(0,5).equals(PREFIX)){if(!encryption?.isEncryptionAvailable())throw new Error('Proteção do Windows indisponível.');return encryption.decryptString(bytes.subarray(5));}return bytes.toString('utf8');}
+function encode(text){if(!encryption)return Buffer.from(text);if(!encryption.isEncryptionAvailable())throw new Error('Proteção do Windows indisponível.');return Buffer.concat([PREFIX,encryption.encryptString(text)]);}
+function validateState(state) {
+  if (!state || state.version !== 2) throw new Error('Formato de arquivo inválido.');
+  const workspace = Workspace.validate(state.workspace);
+  const active = state.active;
+  if (!active || (active.id !== null && (typeof active.id !== 'string' || !/^[\w-]{1,80}$/.test(active.id)))) throw new Error('Rascunho inválido.');
+  return {version:2, workspace, active:{id:active.id, draft:Quote.validateDraft(active.draft)}};
+}
+function parse(text) {
+  if (Buffer.byteLength(text, 'utf8') > LIMIT) throw new Error('Arquivo maior que 8 MB.');
+  return validateState(JSON.parse(text));
+}
+function read(file) {
+  if (!fs.existsSync(file)) return null;
+  try { return parse(decode(fs.readFileSync(file))); }
+  catch (error) {
+    // Never silently replace damaged data with an empty workspace.
+    if (fs.existsSync(file + '.bak')) return parse(decode(fs.readFileSync(file + '.bak')));
+    throw new Error('Não foi possível ler os dados salvos. Preserve o arquivo e restaure um backup.');
+  }
+}
+function write(file, state) {
+  const clean = validateState(state), text = JSON.stringify(clean);
+  if (Buffer.byteLength(text) > LIMIT) throw new Error('Limite de armazenamento atingido (8 MB).');
+  fs.mkdirSync(path.dirname(file), {recursive:true});
+  fs.writeFileSync(file + '.tmp', encode(text), {mode:0o600});
+  if (fs.existsSync(file)) {
+    // Only a validated previous version becomes the recovery copy.
+    try { const old=decode(fs.readFileSync(file));parse(old);fs.writeFileSync(file+'.bak',encode(old),{mode:0o600}); } catch {}
+  }
+  fs.renameSync(file + '.tmp', file);
+  return clean;
+}
+function whatsapp(url) {
+  const parsed = new URL(url);
+  if (parsed.origin !== 'https://wa.me' || !/^\/55[1-9]\d{9,10}$/.test(parsed.pathname) || parsed.username || parsed.password || parsed.hash || [...parsed.searchParams.keys()].some(k=>k!=='text') || url.length>60000) throw new Error('Endereço de WhatsApp inválido.');
+  return parsed.href;
+}
+module.exports = {validateState, parse, read, write, whatsapp, LIMIT, protect};
+const test=require('node:test'),assert=require('node:assert/strict');
+global.Quote=require('../public/quote.js');global.Workspace=require('../public/workspace.js');
+const Sync=require('../public/sync.js');
+const client=name=>({name,phone:'',email:'',address:'',notes:'',deleted:false});
+function server(){const rows=new Map();return {rows,call:async(action,args={})=>{
+  if(action==='pull')return {rows:structuredClone([...rows.values()]),catalog:[]};
+  const r=args.record,key=r.kind+':'+r.id,old=rows.get(key);
+  if((old?.revision??null)!==args.revision)return {conflict:true};
+  const saved={...structuredClone(r),revision:(old?.revision||0)+1};rows.set(key,saved);return [saved];
+}};}
+test('PC e Android compartilham clientes, relatórios, preços, agenda e pagamentos',async()=>{
+  const s=server(),pc=Workspace.empty();
+  Workspace.updateEntity(pc,'clients',client('Cliente de teste'),'client-1');
+  Workspace.updateEntity(pc,'reports',{title:'Relatório',quoteId:'',clientId:'client-1',date:'2026-09-29',findings:'Inspeção',workDone:'Avaliação',recommendations:'Retorno',deleted:false},'report-1');
+  Workspace.updateEntity(pc,'jobs',{title:'Visita',quoteId:'',clientId:'client-1',date:'2026-09-30',status:'Agendado',notes:'',deleted:false},'job-1');
+  Workspace.updateEntity(pc,'payments',{title:'Visita',quoteId:'',date:'2026-09-29',amount:'120.50',method:'Pix',notes:'',deleted:false},'payment-1');
+  Workspace.updateRate(pc,'S001',40);
+  await Sync.exchange(pc,s.call);const phone=(await Sync.exchange(Workspace.empty(),s.call)).data;
+  assert.equal(phone.clients[0].name,'Cliente de teste');assert.equal(phone.reports[0].clientId,'client-1');assert.equal(phone.rates.S001.price,40);assert.equal(phone.payments[0].amount,'120.50');assert.equal(phone.jobs.length,1);
+  Workspace.updateEntity(phone,'clients',{...phone.clients[0],name:'Cliente atualizado'},'client-1');
+  await Sync.exchange(phone,s.call);assert.equal((await Sync.exchange(pc,s.call)).data.clients[0].name,'Cliente atualizado');
+});
+test('edição simultânea converge e preserva as duas versões',async()=>{
+  const s=server(),a=Workspace.empty();Workspace.updateEntity(a,'clients',client('Inicial'),'c');await Sync.exchange(a,s.call);
+  const b=(await Sync.exchange(Workspace.empty(),s.call)).data;
+  Workspace.updateEntity(a,'clients',client('Editado no PC'),'c');Workspace.updateEntity(b,'clients',client('Editado no Android'),'c');
+  await Sync.exchange(a,s.call);const resultB=await Sync.exchange(b,s.call),resultA=await Sync.exchange(a,s.call);
+  assert.equal(resultA.data.clients.length,2);assert.equal(resultB.data.clients.length,2);
+  assert.deepEqual(resultA.data.clients.map(c=>[c.id,c.name]).sort(),resultB.data.clients.map(c=>[c.id,c.name]).sort());
+});
+test('perda da resposta depois da gravação não duplica registros',async()=>{
+  const s=server(),a=Workspace.empty();Workspace.updateEntity(a,'clients',client('Um cliente'),'c');let once=true;
+  await assert.rejects(Sync.exchange(a,async(...args)=>{const result=await s.call(...args);if(args[0]==='push'&&once){once=false;throw new Error('Offline');}return result;}),/Offline/);
+  assert.equal((await Sync.exchange(a,s.call)).data.clients.length,1);assert.equal(s.rows.size,1);
+});
+test('arquivamento se propaga sem ressuscitar versão antiga offline',async()=>{
+  const s=server(),a=Workspace.empty();Workspace.updateEntity(a,'clients',client('Cliente'),'c');await Sync.exchange(a,s.call);
+  const b=(await Sync.exchange(Workspace.empty(),s.call)).data;Workspace.updateEntity(b,'clients',{...b.clients[0],deleted:true},'c');await Sync.exchange(b,s.call);
+  assert.equal((await Sync.exchange(a,s.call)).data.clients[0].deleted,true);
+});
+test('conflito durante gravação provoca nova leitura antes de tentar novamente',async()=>{
+  const s=server(),a=Workspace.empty();Workspace.updateEntity(a,'clients',client('Cliente'),'c');let fail=true,pulls=0;
+  await Sync.exchange(a,async(action,args)=>{if(action==='pull')pulls++;if(action==='push'&&fail){fail=false;return {conflict:true};}return s.call(action,args);});assert.equal(pulls,2);
+});
+test('dados inválidos do servidor não substituem dados locais',async()=>{
+  const a=Workspace.empty();Workspace.updateEntity(a,'clients',client('Preservado'),'c');
+  await assert.rejects(Sync.exchange(a,async()=>({rows:[{kind:'client',id:'x',revision:1,payload:{id:'other'}}]})),/Identidade/);assert.equal(a.clients[0].name,'Preservado');
+});
+"""Atualiza os dados empacotados e gera ícones locais para EXE e APK."""
+from pathlib import Path
+from shutil import copy2
+from PIL import Image, ImageDraw
+
+ROOT = Path(__file__).resolve().parents[1]
+PUBLIC = ROOT / 'central-app/public'
+ASSETS = ROOT / 'central-app/android/app/src/main/assets'
+copy2(ROOT / 'interno/catalogo.js', PUBLIC / 'catalog.js')
+copy2(ROOT / 'interno/orcamento.js', PUBLIC / 'quote.js')
+icon = Image.new('RGBA', (512, 512))
+d = ImageDraw.Draw(icon)
+d.rounded_rectangle((0, 0, 511, 511), 100, fill='#173f35')
+d.polygon([(145,361),(232,150),(287,150),(368,361),(306,361),(287,307),(219,307),(199,361)],fill='#f7f5ee')
+d.polygon([(237,256),(268,256),(253,210)],fill='#173f35')
+d.polygon([(292,244),(228,339),(270,339),(248,402),(327,296),(280,296)],fill='#ffbd69')
+icon.save(PUBLIC / 'icon-512.png')
+icon.resize((192,192),Image.Resampling.LANCZOS).save(PUBLIC / 'icon-192.png')
+icon.save(PUBLIC / 'icon.ico', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])
+ASSETS.mkdir(parents=True, exist_ok=True)
+for source in PUBLIC.iterdir():
+    if source.is_file() and source.suffix in {'.html','.css','.js','.svg','.png','.ico'}:
+        copy2(source, ASSETS / source.name)
+print('Catálogo, cálculo, ícones e recursos locais do Android atualizados.')
+
+          }
+      }
+>     private void validate(JSONObject state) throws Exception {
+          if(state.getInt("version")!=2 || state.getJSONObject("workspace").getInt("version")!=2 || 
+state.getJSONObject("workspace").getJSONArray("quotes").length()>1000 || 
+state.getJSONObject("active").getJSONObject("draft").getInt("version")!=1)throw new Exception("Arquivo inválido.");
+          // Full item, price and revision validation is also performed by packaged workspace.js.
+      }
+      private void reply(String id,Object result,String error){
+          runOnUiThread(()->{if(!isFinishing())web.evaluateJavascript("window.altimaxReply("+JSONObject.quote(id)+","+(
+result==null?"null":result instanceof String?JSONObject.quote((String)result):result.toString())+","+(error==null?"null
+":JSONObject.quote(error))+")",null);});
+      }
+>     private void save(JSONObject state) throws Exception {
+>         validate(state);byte[] bytes=state.toString().getBytes(StandardCharsets.UTF_8);if(bytes.length>LIMIT)throw 
+new Exception("Limite de 8 MB atingido.");
+          storage.write(state.toString());
+      }
+      private class Bridge {
+          @JavascriptInterface public void postMessage(String raw){
+              if(raw==null || raw.length()>LIMIT*2)return;
+                      String method=request.getString("method");JSONObject 
+args=request.optJSONObject("args");if(args==null)args=new JSONObject();
+                      switch(method){
+>                         case "load": {JSONObject result=new JSONObject().put("platform","android");try{JSONObject 
+state=new JSONObject(storage.read());save(state);result.put("state",state);}catch(FileNotFoundException 
+e){result.put("state",JSONObject.NULL);}reply(id,result,null);break;}
+                          case "cloud": {final String requestId=id;final JSONObject 
+values=args;network.execute(()->{try{if(cloud==null)throw new Exception("Credenciais protegidas indisponíveis. 
+Preserve seus arquivos antes de reinstalar.");JSONObject 
+params=values.optJSONObject("values");reply(requestId,cloud.run(values.getString("action"),params==null?new 
+JSONObject():params),null);}catch(Exception e){reply(requestId,null,e.getMessage());}});break;}
+>                         case "save": {JSONObject state=args.getJSONObject("state");save(state);reply(id,new 
+JSONObject().put("workspace",state.getJSONObject("workspace")),null);break;}
+                          default: {final String requestId=id;final JSONObject 
+values=args;runOnUiThread(()->uiRequest(requestId,method,values));}
+                      }
+                  }catch(Exception e){reply(id,null,"Não foi possível concluir: "+e.getMessage());}
+              });
+          }
+                  case "export": {
+                      if(pendingId!=null)throw new Exception("Conclua a seleção de arquivo anterior.");
+>                     String text=args.getString("text");validate(new 
+JSONObject(text));if(text.getBytes(StandardCharsets.UTF_8).length>LIMIT)throw new Exception("Arquivo maior que 8 MB.");
+                      Intent intent=new Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).set
+Type("application/json").putExtra(Intent.EXTRA_TITLE,"ALTIMAX-backup-"+new 
+java.text.SimpleDateFormat("yyyy-MM-dd",java.util.Locale.ROOT).format(new java.util.Date())+".json");
+                      pendingId=id;pendingExport=text;startActivityForResult(intent,101);break;
+                  }
+                  case "import": {
+                      if(pendingId!=null)throw new Exception("Conclua a seleção de arquivo anterior.");
+
+
+
+
+
+
+
+
+Success
+
+
+
+
+
+
+
+
+
+
+
+Encontrei a causa: o orçamento guarda nome, telefone e local como texto, mas não cria um registro na lista de clientes nem guarda seu ID. Os campos adicionais são condições do orçamento — escopo, pagamento, validade e agendamento — e devem continuar separados.
+No mobile já existe um painel de itens, mas ele fica escondido atrás do botão do total. Vou tornar esse acesso explícito e mostrar um resumo visível. Para clientes, vou centralizar a gravação e conferir telefone/e-mail já existentes; nomes iguais, sozinhos, não serão tratados como a mesma pessoa.
+
+
+
+
+  Ran commandsRan $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+@'
+from pathlib import Path
+p=Path('interno/orcamento.js');s=p.read_text(encoding='utf-8');marker="    if(!['Pré-orçamento','Orçamento'].includes(clean.kind))";s=s.replace(marker,"    for(const key of ['clientId','clientEmail']){const v=value[key]??'';if(typeof v!=='string'||v.length>5000||(key==='clientId'&&v&&!/^[\\w-]{1,80}$/.test(v)))throw new Error('Vínculo de cliente inválido.');clean[key]=v;}\n"+marker);p.write_text(s,encoding='utf-8')
+p=Path('central-app/public/workspace.js');s=p.read_text(encoding='utf-8');pos=s.index('  function merge(')
+s=s[:pos]+'''  // ID é a identidade principal. Contatos usam a mesma normalização BR do WhatsApp.
+  const phoneKey=value=>{let d=String(value||'').replace(/\\D/g,'');if(d.length===10||d.length===11)d='55'+d;return /^55[1-9]\\d{9,10}$/.test(d)?d:'';};
+  const emailKey=value=>{const e=String(value||'').trim().toLowerCase();return /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(e)?e:'';};
+  const nameKey=value=>String(value||'').trim().replace(/\\s+/g,' ').toLocaleLowerCase('pt-BR');
+  function clientMatches(workspace,fields,excludeId=''){
+    const phone=phoneKey(fields.phone),email=emailKey(fields.email);
+    return workspace.clients.filter(c=>!c.deleted&&c.id!==excludeId&&((phone&&phoneKey(c.phone)===phone)||(email&&emailKey(c.email)===email)));
+  }
+  function saveClient(workspace,fields,clientId){
+    const clean={deleted:!!fields.deleted};for(const f of entities.clients)clean[f]=String(fields[f]??'').trim();
+    if(!clean.name)throw new Error('Informe o nome do cliente.');
+    if(clientId&&!workspace.clients.some(c=>c.id===clientId))throw new Error('Cliente não encontrado. Selecione novamente.');
+    const matches=clientMatches(workspace,clean,clientId);
+    if(!clean.deleted&&matches.length)throw new Error('Telefone ou e-mail já cadastrado para '+matches.map(c=>c.name).join(', ')+'. Selecione o cadastro existente; não foi criado outro cliente.');
+    return updateEntity(workspace,'clients',clean,clientId);
+  }
+  function linkQuoteClient(workspace,draft){
+    if(!draft.client.trim()){if(draft.clientId)throw new Error('Informe o nome do cliente selecionado.');return '';}
+    if(draft.clientId){
+      if(!workspace.clients.some(c=>c.id===draft.clientId&&!c.deleted))throw new Error('O cliente associado não está disponível. Selecione um cliente ativo.');
+      return draft.clientId;
+    }
+    const fields={name:draft.client,phone:draft.phone,email:draft.clientEmail||'',address:draft.location,notes:''};
+    const matches=clientMatches(workspace,fields);
+    if(matches.length>1)throw new Error('Telefone e e-mail correspondem a cadastros diferentes. Selecione o cliente correto antes de salvar.');
+    if(matches.length===1){
+      if(nameKey(matches[0].name)!==nameKey(fields.name))throw new Error('Esse contato pertence a '+matches[0].name+'. Selecione o cliente correto antes de salvar.');
+      return matches[0].id;
+    }
+    if(!phoneKey(fields.phone)&&!emailKey(fields.email)&&workspace.clients.some(c=>!c.deleted&&nameKey(c.name)===nameKey(fields.name)))throw new Error('Já existe um cliente com esse nome. Selecione o cadastro ou informe um telefone/e-mail que diferencie as pessoas.');
+    return saveClient(workspace,fields);
+  }
+  function saveQuoteWithClient(workspace,draft,quoteId,status='rascunho'){
+    // Prepara uma única gravação local com cliente e orçamento; não altera a entrada se a validação falhar.
+    const data=validate(workspace),clean=Quote.validateDraft(draft);
+    clean.clientId=linkQuoteClient(data,clean);
+    const id=updateQuote(data,clean,quoteId,status);
+    return {workspace:validate(data),draft:clean,id};
+  }
+  function clientDuplicateWarnings(workspace){
+    const warnings=[],seen=new Map();
+    for(const c of workspace.clients.filter(c=>!c.deleted))for(const key of [phoneKey(c.phone)&&'p:'+phoneKey(c.phone),emailKey(c.email)&&'e:'+emailKey(c.email)]){
+      if(!key)continue;const previous=seen.get(key);
+      if(previous&&previous.id!==c.id)warnings.push('Clientes com contato repetido: '+previous.name+' e '+c.name+'. Confira os cadastros antes de reutilizar.');else seen.set(key,c);
+    }
+    return [...new Set(warnings)];
+  }
+''' +s[pos:]
+s=s.replace("return {data:a,conflicts};","return {data:a,conflicts:[...new Set([...conflicts,...clientDuplicateWarnings(a)])]};")
+s=s.replace('updateEntity,entities,merge','updateEntity,entities,merge,saveClient,saveQuoteWithClient,clientMatches,clientDuplicateWarnings');p.write_text(s,encoding='utf-8')
+p=Path('central-app/public/sync.js');s=p.read_text(encoding='utf-8');s=s.replace('for(const r of records(data)){',"// Clientes primeiro: um orçamento novo não sobe antes do cadastro que referencia.\n      for(const r of records(data).sort((a,b)=>Number(b.kind==='client')-Number(a.kind==='client'))){");p.write_text(s,encoding='utf-8')
+p=Path('central-app/public/index.html');s=p.read_text(encoding='utf-8');s=s.replace('<div class="builder-grid">','<section id="mobile-summary" class="mobile-summary" aria-label="Resumo do orçamento"><div><h2>Itens do orçamento <span id="summary-count">0</span></h2><strong id="summary-total">R$ 0,00</strong></div><p id="summary-empty">Adicione serviços para montar o orçamento.</p><ul id="summary-items" aria-live="polite"></ul><button id="summary-open" class="secondary" aria-controls="basket-dialog">Ver itens e editar</button></section><div class="builder-grid">',1)
+s=s.replace('Seu orçamento <span id="item-count">','Itens do orçamento <span id="item-count">')
+s=s.replace('<div id="basket-items"></div>','<div id="basket-items"></div><button id="continue-services" class="secondary mobile-only">＋ Continuar adicionando serviços</button>')
+s=s.replace('<span>Ver orçamento · <b id="mobile-count">','<span>Ver itens e editar · <b id="mobile-count">').replace('id="mobile-total" class="mobile-total"','id="mobile-total" class="mobile-total" aria-controls="basket-dialog" aria-expanded="false"')
+s=s.replace('<div id="toast"','<dialog id="basket-dialog" aria-label="Itens do orçamento"></dialog>\n<div id="toast"',1)
+s=s.replace('<div class="review-grid"><div><div class="field-grid">','<div class="review-grid"><div><label>Buscar cliente cadastrado<input id="quote-client-search" type="search" placeholder="Nome, telefone ou e-mail"></label><label>Selecionar cliente<select id="quote-client-select"><option value="">Novo cliente / sem vínculo</option></select></label><p id="quote-client-note" class="hint"></p><div class="field-grid">',1)
+s=s.replace('<label>Bairro / local<input data-field="location"','<label>E-mail do cliente<input data-field="clientEmail" type="email" maxlength="254"></label><label>Local deste atendimento<input data-field="location"',1)
+s=s.replace('<button id="save-quote" class="secondary">','<p id="quote-save-error" role="alert"></p><button id="save-quote" class="secondary">',1)
+s=s.replace('<div id="entity-list"','<p id="client-duplicates" role="status"></p><div id="entity-list"',1);p.write_text(s,encoding='utf-8')
+p=Path('central-app/public/app.css');s=p.read_text(encoding='utf-8');s=s.replace('.mobile-nav,.mobile-total,.mobile-only,#print-sheet{display:none}', '.mobile-nav,.mobile-total,.mobile-only,.mobile-summary,#print-sheet{display:none}')
+s=s.replace('.basket.open{display:block;position:fixed;inset:75px 10px 75px;overflow-y:auto;z-index:30;box-shadow:0 0 0 100vmax #0d281c80;padding:24px}', '.basket.open{display:block;position:static;border:0;box-shadow:none;padding:20px}.basket-item-foot{flex-wrap:wrap}.stepper button{min-width:36px;min-height:36px}.remove{min-width:36px;min-height:36px}')
+s+='''
+#basket-dialog{padding:0;width:calc(100% - 20px);max-width:600px;max-height:88vh;max-height:88dvh;overscroll-behavior:contain}body.basket-modal{overflow:hidden}
+.mobile-summary{background:white;border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:22px}.mobile-summary>div{display:flex;justify-content:space-between;align-items:center;gap:12px}.mobile-summary h2{font-size:15px;margin:0}.mobile-summary h2 span{font-size:12px;color:var(--muted)}.mobile-summary ul{padding:0;list-style:none;font-size:12px;margin:12px 0}.mobile-summary li{padding:5px 0;overflow-wrap:anywhere}.mobile-summary p{font-size:12px;margin:12px 0}.mobile-summary .secondary{width:100%}#quote-save-error,#client-duplicates{color:var(--red);font-size:12px}#basket-items strong{overflow-wrap:anywhere}
+@media(max-width:900px){.mobile-summary{display:block}.basket>.mobile-only{display:block;width:100%}.mobile-total{bottom:calc(75px + env(safe-area-inset-bottom))}.toast{bottom:calc(145px + env(safe-area-inset-bottom))}.basket-modal .toast{display:none}}
+''';p.write_text(s,encoding='utf-8')
+'@ | python -
+Shell
+$$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+@'
+from pathlib import Path
+p=Path('interno/orcamento.js');s=p.read_text(encoding='utf-8');marker="    if(!['Pré-orçamento','Orçamento'].includes(clean.kind))";s=s.replace(marker,"    for(const key of ['clientId','clientEmail']){const v=value[key]??'"''"';if(typeof v!=='string'||v.length>5000||(key==='clientId'&&v&&!/^[\\w-]{1,80}$/.test(v)))throw new Error('Vínculo de cliente inválido.');clean[key]=v;}\n"+marker);p.write_text(s,encoding='utf-8')
+p=Path('central-app/public/workspace.js');s=p.read_text(encoding='utf-8');pos=s.index('  function merge(')
+s=s[:pos]+'"'''"'  // ID é a identidade principal. Contatos usam a mesma normalização BR do WhatsApp.
+  const phoneKey=value=>{let d=String(value||'"''"').replace(/\\D/g,'"''"');if(d.length===10||d.length===11)d='55'+d;return /^55[1-9]\\d{9,10}$/.test(d)?d:'"''"';};
+  const emailKey=value=>{const e=String(value||'"''"').trim().toLowerCase();return /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(e)?e:'"''"';};
+  const nameKey=value=>String(value||'"''"').trim().replace(/\\s+/g,' ').toLocaleLowerCase('pt-BR');
+  function clientMatches(workspace,fields,excludeId='"''"'){
+    const phone=phoneKey(fields.phone),email=emailKey(fields.email);
+    return workspace.clients.filter(c=>!c.deleted&&c.id!==excludeId&&((phone&&phoneKey(c.phone)===phone)||(email&&emailKey(c.email)===email)));
+  }
+  function saveClient(workspace,fields,clientId){
+    const clean={deleted:!!fields.deleted};for(const f of entities.clients)clean[f]=String(fields[f]??'"''"').trim();
+    if(!clean.name)throw new Error('Informe o nome do cliente.');
+    if(clientId&&!workspace.clients.some(c=>c.id===clientId))throw new Error('Cliente não encontrado. Selecione novamente.');
+    const matches=clientMatches(workspace,clean,clientId);
+    if(!clean.deleted&&matches.length)throw new Error('Telefone ou e-mail já cadastrado para '+matches.map(c=>c.name).join(', ')+'. Selecione o cadastro existente; não foi criado outro cliente.');
+    return updateEntity(workspace,'clients',clean,clientId);
+  }
+  function linkQuoteClient(workspace,draft){
+    if(!draft.client.trim()){if(draft.clientId)throw new Error('Informe o nome do cliente selecionado.');return '"''"';}
+    if(draft.clientId){
+      if(!workspace.clients.some(c=>c.id===draft.clientId&&!c.deleted))throw new Error('O cliente associado não está disponível. Selecione um cliente ativo.');
+      return draft.clientId;
+    }
+    const fields={name:draft.client,phone:draft.phone,email:draft.clientEmail||'"''"',address:draft.location,notes:'"''"'};
+    const matches=clientMatches(workspace,fields);
+    if(matches.length>1)throw new Error('Telefone e e-mail correspondem a cadastros diferentes. Selecione o cliente correto antes de salvar.');
+    if(matches.length===1){
+      if(nameKey(matches[0].name)!==nameKey(fields.name))throw new Error('Esse contato pertence a '+matches[0].name+'. Selecione o cliente correto antes de salvar.');
+      return matches[0].id;
+    }
+    if(!phoneKey(fields.phone)&&!emailKey(fields.email)&&workspace.clients.some(c=>!c.deleted&&nameKey(c.name)===nameKey(fields.name)))throw new Error('Já existe um cliente com esse nome. Selecione o cadastro ou informe um telefone/e-mail que diferencie as pessoas.');
+    return saveClient(workspace,fields);
+  }
+  function saveQuoteWithClient(workspace,draft,quoteId,status='rascunho'){
+    // Prepara uma única gravação local com cliente e orçamento; não altera a entrada se a validação falhar.
+    const data=validate(workspace),clean=Quote.validateDraft(draft);
+    clean.clientId=linkQuoteClient(data,clean);
+    const id=updateQuote(data,clean,quoteId,status);
+    return {workspace:validate(data),draft:clean,id};
+  }
+  function clientDuplicateWarnings(workspace){
+    const warnings=[],seen=new Map();
+    for(const c of workspace.clients.filter(c=>!c.deleted))for(const key of [phoneKey(c.phone)&&'p:'+phoneKey(c.phone),emailKey(c.email)&&'e:'+emailKey(c.email)]){
+      if(!key)continue;const previous=seen.get(key);
+      if(previous&&previous.id!==c.id)warnings.push('Clientes com contato repetido: '+previous.name+' e '+c.name+'. Confira os cadastros antes de reutilizar.');else seen.set(key,c);
+    }
+    return [...new Set(warnings)];
+  }
+'"'''"' +s[pos:]
+s=s.replace("return {data:a,conflicts};","return {data:a,conflicts:[...new Set([...conflicts,...clientDuplicateWarnings(a)])]};")
+s=s.replace('updateEntity,entities,merge','updateEntity,entities,merge,saveClient,saveQuoteWithClient,clientMatches,clientDuplicateWarnings');p.write_text(s,encoding='utf-8')
+p=Path('central-app/public/sync.js');s=p.read_text(encoding='utf-8');s=s.replace('for(const r of records(data)){',"// Clientes primeiro: um orçamento novo não sobe antes do cadastro que referencia.\n      for(const r of records(data).sort((a,b)=>Number(b.kind==='client')-Number(a.kind==='client'))){");p.write_text(s,encoding='utf-8')
+p=Path('central-app/public/index.html');s=p.read_text(encoding='utf-8');s=s.replace('<div class="builder-grid">','<section id="mobile-summary" class="mobile-summary" aria-label="Resumo do orçamento"><div><h2>Itens do orçamento <span id="summary-count">0</span></h2><strong id="summary-total">R$ 0,00</strong></div><p id="summary-empty">Adicione serviços para montar o orçamento.</p><ul id="summary-items" aria-live="polite"></ul><button id="summary-open" class="secondary" aria-controls="basket-dialog">Ver itens e editar</button></section><div class="builder-grid">',1)
+s=s.replace('Seu orçamento <span id="item-count">','Itens do orçamento <span id="item-count">')
+s=s.replace('<div id="basket-items"></div>','<div id="basket-items"></div><button id="continue-services" class="secondary mobile-only">＋ Continuar adicionando serviços</button>')
+s=s.replace('<span>Ver orçamento · <b id="mobile-count">','<span>Ver itens e editar · <b id="mobile-count">').replace('id="mobile-total" class="mobile-total"','id="mobile-total" class="mobile-total" aria-controls="basket-dialog" aria-expanded="false"')
+s=s.replace('<div id="toast"','<dialog id="basket-dialog" aria-label="Itens do orçamento"></dialog>\n<div id="toast"',1)
+s=s.replace('<div class="review-grid"><div><div class="field-grid">','<div class="review-grid"><div><label>Buscar cliente cadastrado<input id="quote-client-search" type="search" placeholder="Nome, telefone ou e-mail"></label><label>Selecionar cliente<select id="quote-client-select"><option value="">Novo cliente / sem vínculo</option></select></label><p id="quote-client-note" class="hint"></p><div class="field-grid">',1)
+s=s.replace('<label>Bairro / local<input data-field="location"','<label>E-mail do cliente<input data-field="clientEmail" type="email" maxlength="254"></label><label>Local deste atendimento<input data-field="location"',1)
+s=s.replace('<button id="save-quote" class="secondary">','<p id="quote-save-error" role="alert"></p><button id="save-quote" class="secondary">',1)
+s=s.replace('<div id="entity-list"','<p id="client-duplicates" role="status"></p><div id="entity-list"',1);p.write_text(s,encoding='utf-8')
+p=Path('central-app/public/app.css');s=p.read_text(encoding='utf-8');s=s.replace('.mobile-nav,.mobile-total,.mobile-only,#print-sheet{display:none}', '.mobile-nav,.mobile-total,.mobile-only,.mobile-summary,#print-sheet{display:none}')
+s=s.replace('.basket.open{display:block;position:fixed;inset:75px 10px 75px;overflow-y:auto;z-index:30;box-shadow:0 0 0 100vmax #0d281c80;padding:24px}', '.basket.open{display:block;position:static;border:0;box-shadow:none;padding:20px}.basket-item-foot{flex-wrap:wrap}.stepper button{min-width:36px;min-height:36px}.remove{min-width:36px;min-height:36px}')
+s+='"'''"'
+#basket-dialog{padding:0;width:calc(100% - 20px);max-width:600px;max-height:88vh;max-height:88dvh;overscroll-behavior:contain}body.basket-modal{overflow:hidden}
+.mobile-summary{background:white;border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:22px}.mobile-summary>div{display:flex;justify-content:space-between;align-items:center;gap:12px}.mobile-summary h2{font-size:15px;margin:0}.mobile-summary h2 span{font-size:12px;color:var(--muted)}.mobile-summary ul{padding:0;list-style:none;font-size:12px;margin:12px 0}.mobile-summary li{padding:5px 0;overflow-wrap:anywhere}.mobile-summary p{font-size:12px;margin:12px 0}.mobile-summary .secondary{width:100%}#quote-save-error,#client-duplicates{color:var(--red);font-size:12px}#basket-items strong{overflow-wrap:anywhere}
+@media(max-width:900px){.mobile-summary{display:block}.basket>.mobile-only{display:block;width:100%}.mobile-total{bottom:calc(75px + env(safe-area-inset-bottom))}.toast{bottom:calc(145px + env(safe-area-inset-bottom))}.basket-modal .toast{display:none}}
+'"'''"';p.write_text(s,encoding='utf-8')
+'@ | python -
+
+
+No output
+
+
+
+
+
+Success
+
+
+
+
+
+
+Ran $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+@'
+from pathlib import Path
+p=Path('central-app/public/app.js');s=p.read_text(encoding='utf-8');s=s.replace("client:'',location:'',phone:''","client:'',clientId:'',clientEmail:'',location:'',phone:''")
+s=s.replace("$('basket').classList.remove('open');if(view", "closeBasket();if(view")
+s=s.replace("$('item-count').textContent=draft.items.length;$('mobile-count').textContent=count;", "$('item-count').textContent=draft.items.length;$('mobile-count').textContent=count;\n    $('summary-count').textContent='('+draft.items.length+')';$('summary-empty').hidden=!!draft.items.length;$('summary-items').replaceChildren();\n    for(const item of draft.items.slice(0,3))$('summary-items').append(element('li','',item.quantity+' × '+item.name+' · '+(item.price==null?'Definir preço':money(item.price*item.quantity))));\n    if(draft.items.length>3)$('summary-items').append(element('li','','Mais '+(draft.items.length-3)+' itens — toque em Ver itens e editar.'));")
+s=s.replace("$('mobile-amount').textContent=amount+' →';","$('mobile-amount').textContent=amount+' →';$('summary-total').textContent=amount;")
+s=s.replace("const edit=element('button','unit-edit',item.price==null?'Definir preço':money(item.price)+' / un.');", "const edit=element('button','unit-edit',item.price==null?'Definir preço':money(item.price)+' / un.');edit.setAttribute('aria-label','Editar '+item.name);")
+start=s.index("  $('mobile-total').addEventListener('click'");end=s.index('  function newQuote()',start)
+s=s[:start]+'''  function openBasket(){if(!matchMedia('(max-width:900px)').matches)return;$('basket-dialog').append($('basket'));$('basket').classList.add('open');$('basket-dialog').showModal();document.body.classList.add('basket-modal');$('mobile-total').setAttribute('aria-expanded','true');}
+  function closeBasket(){if($('basket-dialog').open)$('basket-dialog').close();document.querySelector('.builder-grid').append($('basket'));$('basket').classList.remove('open');document.body.classList.remove('basket-modal');$('mobile-total').setAttribute('aria-expanded','false');}
+  $('basket-dialog').addEventListener('close',closeBasket);
+  $('mobile-total').addEventListener('click',openBasket);$('summary-open').addEventListener('click',openBasket);
+  $('close-basket').addEventListener('click',closeBasket);$('continue-services').addEventListener('click',closeBasket);
+  matchMedia('(max-width:900px)').addEventListener('change',e=>{if(!e.matches)closeBasket();});
+''' +s[end:]
+s=s.replace("document.querySelectorAll('[data-field]').forEach(e=>e.value=draft[e.dataset.field]);renderMessage();$('review-dialog').showModal();", "renderClientOptions();fillReviewFields();$('quote-save-error').textContent='';renderMessage();$('review-dialog').showModal();")
+pos=s.index('  function renderMessage()')
+s=s[:pos]+'''  function fillReviewFields(){document.querySelectorAll('[data-field]').forEach(e=>e.value=draft[e.dataset.field]||'');clientNote();}
+  function clientNote(){
+    const selected=workspace.clients.find(c=>c.id===draft.clientId&&!c.deleted);
+    const matches=Workspace.clientMatches(workspace,{phone:draft.phone,email:draft.clientEmail});
+    $('quote-client-note').textContent=selected?'Cliente vinculado: '+selected.name+'. Os dados deste orçamento preservam o atendimento; alterações aqui não substituem o cadastro em Gestão.':matches.length?'Contato encontrado: '+matches.map(c=>c.name).join(', ')+'. Selecione o cadastro para conferir.':'Ao guardar o orçamento, o cliente informado também será cadastrado em Clientes. O local será o endereço inicial do novo cadastro; condições e observações continuam no orçamento.';
+  }
+  function renderClientOptions(){
+    const select=$('quote-client-select'),term=normalize($('quote-client-search').value);select.replaceChildren();const option=element('option','','Novo cliente / sem vínculo');option.value='';select.append(option);
+    for(const c of workspace.clients.filter(c=>!c.deleted&&(c.id===draft.clientId||normalize(c.name+' '+c.phone+' '+c.email).includes(term)))){const o=element('option','',c.name+(c.phone?' · '+c.phone:'')+(c.email?' · '+c.email:''));o.value=c.id;select.append(o);}
+    select.value=draft.clientId||'';clientNote();
+  }
+  function selectQuoteClient(c){draft.clientId=c.id;draft.client=c.name;draft.phone=c.phone;draft.clientEmail=c.email;draft.location=c.address;persist();}
+  $('quote-client-search').addEventListener('input',renderClientOptions);
+  $('quote-client-select').addEventListener('change',()=>{const c=workspace.clients.find(c=>c.id===$('quote-client-select').value&&!c.deleted);if(c)selectQuoteClient(c);else{draft.clientId='';draft.client='';draft.phone='';draft.clientEmail='';persist();}fillReviewFields();renderMessage();});
+''' +s[pos:]
+s=s.replace("draft[e.dataset.field]=e.value;persist();renderMessage();", "draft[e.dataset.field]=e.value;persist();clientNote();renderMessage();")
+start=s.index("  async function saveQuote(");end=s.index("  $('copy-message')",start)
+s=s[:start]+'''  let savingQuote=false;
+  async function saveQuote(status='rascunho'){
+    if(savingQuote)throw new Error('Aguarde a gravação do orçamento.');savingQuote=true;$('save-quote').disabled=true;$('save-quick').disabled=true;$('quote-save-error').textContent='Salvando cliente e orçamento…';
+    try{const next=Workspace.saveQuoteWithClient(workspace,draft,activeId,status);workspace=next.workspace;draft=next.draft;activeId=next.id;await flush();renderSaved();renderEntities();renderClientOptions();$('quote-save-error').textContent='';toast('Orçamento e cliente guardados neste aparelho.');queueSync();}
+    catch(e){$('quote-save-error').textContent=e.message+' Confira os dados e tente salvar novamente.';throw e;}
+    finally{savingQuote=false;$('save-quote').disabled=false;$('save-quick').disabled=!draft.items.length;}
+  }
+  $('save-quick').addEventListener('click',()=>saveQuote().catch(e=>toast(e.message)));
+  $('save-quote').addEventListener('click',()=>saveQuote().catch(e=>toast(e.message)));
+''' +s[end:]
+s=s.replace("['client','phone','location','reference']", "['client','clientId','clientEmail','phone','location','reference']")
+s=s.replace("draft.client=e.name;draft.phone=e.phone;draft.location=e.address;persist();setView", "selectQuoteClient(e);setView")
+s=s.replace("const key=$('entity-kind').value,term=normalize($('entity-search').value);$('entity-list').replaceChildren();", "const key=$('entity-kind').value,term=normalize($('entity-search').value);$('entity-list').replaceChildren();$('client-duplicates').textContent=key==='clients'?Workspace.clientDuplicateWarnings(workspace).join(' '):'';")
+start=s.index("  $('entity-form').addEventListener('submit'");end=s.index('\n\n  try{',start)
+s=s[:start]+'''  $('entity-form').addEventListener('submit',async e=>{e.preventDefault();const button=$('entity-form').querySelector('button');button.disabled=true;$('entity-error').textContent='Salvando…';try{const fields={deleted:false};document.querySelectorAll('[data-entity-field]').forEach(input=>fields[input.dataset.entityField]=input.value.trim());const key=$('entity-kind').value;entityEditing=key==='clients'?Workspace.saveClient(workspace,fields,entityEditing):Workspace.updateEntity(workspace,key,fields,entityEditing);await flush();renderEntities();renderClientOptions();$('entity-dialog').close();toast('Registro salvo neste aparelho.');queueSync();}catch(error){$('entity-error').textContent=error.message+' Não foi possível concluir a gravação. Tente novamente.';}finally{button.disabled=false;}});
+''' +s[end:];p.write_text(s,encoding='utf-8')
+'@ | python -
+python scripts/preparar_aplicativos.py
+npm test --prefix central-app
+Shell
+$$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+@'
+from pathlib import Path
+p=Path('central-app/public/app.js');s=p.read_text(encoding='utf-8');s=s.replace("client:'"''"',location:'"''"',phone:'"''"'","client:'"''"',clientId:'"''"',clientEmail:'"''"',location:'"''"',phone:'"''"'")
+s=s.replace("$('basket').classList.remove('open');if(view", "closeBasket();if(view")
+s=s.replace("$('item-count').textContent=draft.items.length;$('mobile-count').textContent=count;", "$('item-count').textContent=draft.items.length;$('mobile-count').textContent=count;\n    $('summary-count').textContent='('+draft.items.length+')';$('summary-empty').hidden=!!draft.items.length;$('summary-items').replaceChildren();\n    for(const item of draft.items.slice(0,3))$('summary-items').append(element('li','"''"',item.quantity+' × '+item.name+' · '+(item.price==null?'Definir preço':money(item.price*item.quantity))));\n    if(draft.items.length>3)$('summary-items').append(element('li','"''"','Mais '+(draft.items.length-3)+' itens — toque em Ver itens e editar.'));")
+s=s.replace("$('mobile-amount').textContent=amount+' →';","$('mobile-amount').textContent=amount+' →';$('summary-total').textContent=amount;")
+s=s.replace("const edit=element('button','unit-edit',item.price==null?'Definir preço':money(item.price)+' / un.');", "const edit=element('button','unit-edit',item.price==null?'Definir preço':money(item.price)+' / un.');edit.setAttribute('aria-label','Editar '+item.name);")
+start=s.index("  $('mobile-total').addEventListener('click'");end=s.index('  function newQuote()',start)
+s=s[:start]+'"'''"'  function openBasket(){if(!matchMedia('(max-width:900px)').matches)return;$('basket-dialog').append($('basket'));$('basket').classList.add('open');$('basket-dialog').showModal();document.body.classList.add('basket-modal');$('mobile-total').setAttribute('aria-expanded','true');}
+  function closeBasket(){if($('basket-dialog').open)$('basket-dialog').close();document.querySelector('.builder-grid').append($('basket'));$('basket').classList.remove('open');document.body.classList.remove('basket-modal');$('mobile-total').setAttribute('aria-expanded','false');}
+  $('basket-dialog').addEventListener('close',closeBasket);
+  $('mobile-total').addEventListener('click',openBasket);$('summary-open').addEventListener('click',openBasket);
+  $('close-basket').addEventListener('click',closeBasket);$('continue-services').addEventListener('click',closeBasket);
+  matchMedia('(max-width:900px)').addEventListener('change',e=>{if(!e.matches)closeBasket();});
+'"'''"' +s[end:]
+s=s.replace("document.querySelectorAll('[data-field]').forEach(e=>e.value=draft[e.dataset.field]);renderMessage();$('review-dialog').showModal();", "renderClientOptions();fillReviewFields();$('quote-save-error').textContent='"''"';renderMessage();$('review-dialog').showModal();")
+pos=s.index('  function renderMessage()')
+s=s[:pos]+'"'''"'  function fillReviewFields(){document.querySelectorAll('[data-field]').forEach(e=>e.value=draft[e.dataset.field]||'"''"');clientNote();}
+  function clientNote(){
+    const selected=workspace.clients.find(c=>c.id===draft.clientId&&!c.deleted);
+    const matches=Workspace.clientMatches(workspace,{phone:draft.phone,email:draft.clientEmail});
+    $('quote-client-note').textContent=selected?'Cliente vinculado: '+selected.name+'. Os dados deste orçamento preservam o atendimento; alterações aqui não substituem o cadastro em Gestão.':matches.length?'Contato encontrado: '+matches.map(c=>c.name).join(', ')+'. Selecione o cadastro para conferir.':'Ao guardar o orçamento, o cliente informado também será cadastrado em Clientes. O local será o endereço inicial do novo cadastro; condições e observações continuam no orçamento.';
+  }
+  function renderClientOptions(){
+    const select=$('quote-client-select'),term=normalize($('quote-client-search').value);select.replaceChildren();const option=element('option','"''"','Novo cliente / sem vínculo');option.value='"''"';select.append(option);
+    for(const c of workspace.clients.filter(c=>!c.deleted&&(c.id===draft.clientId||normalize(c.name+' '+c.phone+' '+c.email).includes(term)))){const o=element('option','"''"',c.name+(c.phone?' · '+c.phone:'"''"')+(c.email?' · '+c.email:'"''"'));o.value=c.id;select.append(o);}
+    select.value=draft.clientId||'"''"';clientNote();
+  }
+  function selectQuoteClient(c){draft.clientId=c.id;draft.client=c.name;draft.phone=c.phone;draft.clientEmail=c.email;draft.location=c.address;persist();}
+  $('quote-client-search').addEventListener('input',renderClientOptions);
+  $('quote-client-select').addEventListener('change',()=>{const c=workspace.clients.find(c=>c.id===$('quote-client-select').value&&!c.deleted);if(c)selectQuoteClient(c);else{draft.clientId='"''"';draft.client='"''"';draft.phone='"''"';draft.clientEmail='"''"';persist();}fillReviewFields();renderMessage();});
+'"'''"' +s[pos:]
+s=s.replace("draft[e.dataset.field]=e.value;persist();renderMessage();", "draft[e.dataset.field]=e.value;persist();clientNote();renderMessage();")
+start=s.index("  async function saveQuote(");end=s.index("  $('copy-message')",start)
+s=s[:start]+'"'''"'  let savingQuote=false;
+  async function saveQuote(status='rascunho'){
+    if(savingQuote)throw new Error('Aguarde a gravação do orçamento.');savingQuote=true;$('save-quote').disabled=true;$('save-quick').disabled=true;$('quote-save-error').textContent='Salvando cliente e orçamento…';
+    try{const next=Workspace.saveQuoteWithClient(workspace,draft,activeId,status);workspace=next.workspace;draft=next.draft;activeId=next.id;await flush();renderSaved();renderEntities();renderClientOptions();$('quote-save-error').textContent='"''"';toast('Orçamento e cliente guardados neste aparelho.');queueSync();}
+    catch(e){$('quote-save-error').textContent=e.message+' Confira os dados e tente salvar novamente.';throw e;}
+    finally{savingQuote=false;$('save-quote').disabled=false;$('save-quick').disabled=!draft.items.length;}
+  }
+  $('save-quick').addEventListener('click',()=>saveQuote().catch(e=>toast(e.message)));
+  $('save-quote').addEventListener('click',()=>saveQuote().catch(e=>toast(e.message)));
+'"'''"' +s[end:]
+s=s.replace("['client','phone','location','reference']", "['client','clientId','clientEmail','phone','location','reference']")
+s=s.replace("draft.client=e.name;draft.phone=e.phone;draft.location=e.address;persist();setView", "selectQuoteClient(e);setView")
+s=s.replace("const key=$('entity-kind').value,term=normalize($('entity-search').value);$('entity-list').replaceChildren();", "const key=$('entity-kind').value,term=normalize($('entity-search').value);$('entity-list').replaceChildren();$('client-duplicates').textContent=key==='clients'?Workspace.clientDuplicateWarnings(workspace).join(' '):'"''"';")
+start=s.index("  $('entity-form').addEventListener('submit'");end=s.index('\n\n  try{',start)
+s=s[:start]+'"'''"'  $('entity-form').addEventListener('submit',async e=>{e.preventDefault();const button=$('entity-form').querySelector('button');button.disabled=true;$('entity-error').textContent='Salvando…';try{const fields={deleted:false};document.querySelectorAll('[data-entity-field]').forEach(input=>fields[input.dataset.entityField]=input.value.trim());const key=$('entity-kind').value;entityEditing=key==='clients'?Workspace.saveClient(workspace,fields,entityEditing):Workspace.updateEntity(workspace,key,fields,entityEditing);await flush();renderEntities();renderClientOptions();$('entity-dialog').close();toast('Registro salvo neste aparelho.');queueSync();}catch(error){$('entity-error').textContent=error.message+' Não foi possível concluir a gravação. Tente novamente.';}finally{button.disabled=false;}});
+'"'''"' +s[end:];p.write_text(s,encoding='utf-8')
+'@ | python -
+python scripts/preparar_aplicativos.py
+npm test --prefix central-app
+
+
+Cat�logo, c�lculo, �cones e recursos locais do Android atualizados.
+
+> altimax-orcamentos@2.0.3 test
+> node --test tests/*.test.cjs
+
+✔ erros de autenticação são traduzidos sem expor detalhes arbitrários (3.4606ms)
+✔ transporte nativo limita destino, protege credenciais e recusa troca de proprietário (48.7558ms)
+✔ falha HTTP não devolve corpo de erro com tokens ou detalhes internos (4.3333ms)
+✔ recupera conta excluída somente após autenticar e autorizar a nova conta (6.4682ms)
+✔ PC e Android compartilham clientes, relatórios, preços, agenda e pagamentos (24.0186ms)
+✔ edição simultânea converge e preserva as duas versões (7.1863ms)
+✔ perda da resposta depois da gravação não duplica registros (2.0072ms)
+✔ arquivamento se propaga sem ressuscitar versão antiga offline (3.5326ms)
+✔ conflito durante gravação provoca nova leitura antes de tentar novamente (3.3149ms)
+✔ dados inválidos do servidor não substituem dados locais (2.2849ms)
+✔ mínimo único, centavos e adicional somente na mão de obra (3.7993ms)
+✔ importação idempotente e edição descendente atualiza orçamento (15.0837ms)
+✔ edições independentes preservam ambas sem duplicar a cada importação (26.5006ms)
+✔ preços conflitantes são avisados e a escolha converge nos aparelhos (0.9769ms)
+✔ entrada inválida é rejeitada antes de alterar o arquivo (30.7404ms)
+✔ somente endereço de WhatsApp permitido no sistema operacional (1.2006ms)
+ℹ tests 16
+ℹ suites 0
+ℹ pass 16
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 663.9604
+
+
+
+
+
+
+Success
+
+
+
+
+
+
+Ran Get-Content -Encoding UTF8 central-app/tests/workspace.test.cjs | Select-Object -First 28
+rg -n 'mobile-total|basket|save-quote|entity-list' central-app/tests/interface.py
+Get-Content -Encoding UTF8 central-app/public/native.js | Select-Object -First 45
+Shell
+$Get-Content -Encoding UTF8 central-app/tests/workspace.test.cjs | Select-Object -First 28
+rg -n 'mobile-total|basket|save-quote|entity-list' central-app/tests/interface.py
+Get-Content -Encoding UTF8 central-app/public/native.js | Select-Object -First 45
+
+
+'use strict';
+const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path');
+global.Quote=require('../public/quote.js');
+const Workspace=require('../public/workspace.js'),Store=require('../desktop/store.cjs');
+const blank=()=>({version:1,items:[{id:'S001',name:'Tomada',quantity:1,price:100}],client:'Cliente fictício',location:'Paciência',phone:'21999999999',reference:'TESTE-01',kind:'Pré-orçamento',scope:'Ponto existente',validity:'7 dias',schedule:'A combinar',payment:'Pix',notes:'',surchargeReason:'',minimum:120,percent:0,materials:0,travel:0,discount:0});
+test('mínimo único, centavos e adicional somente na mão de obra',()=>{
+ const d=blank();assert.equal(Quote.calculate(d).total,12000);d.items[0].quantity=2;d.percent=30;d.surchargeReason='Noturno';d.materials=20;d.travel=15;d.discount=5;assert.equal(Quote.calculate(d).total,29000);
+ d.items[0].price=null;assert.throws(()=>Quote.calculate(d),/preço/);assert.throws(()=>Quote.message(d));
+});
+test('importação idempotente e edição descendente atualiza orçamento',()=>{
+ const a=Workspace.empty(),id=Workspace.updateQuote(a,blank());
+ const b=Workspace.merge(Workspace.empty(),a).data;
+ assert.equal(Workspace.merge(a,b).data.quotes.length,1);
+ const d=blank();d.client='Atualizado';Workspace.updateQuote(b,d,id);
+ const merged=Workspace.merge(a,b);assert.equal(merged.data.quotes.length,1);assert.equal(merged.data.quotes[0].draft.client,'Atualizado');assert.equal(merged.conflicts.length,0);
+ assert.equal(Workspace.merge(merged.data,a).data.quotes[0].draft.client,'Atualizado');
+});
+test('edições independentes preservam ambas sem duplicar a cada importação',()=>{
+ const a=Workspace.empty(),id=Workspace.updateQuote(a,blank()),b=Workspace.merge(Workspace.empty(),a).data;
+ const d=blank();d.client='PC';Workspace.updateQuote(a,d,id);d.client='Celular';Workspace.updateQuote(b,d,id);
+ const merged=Workspace.merge(a,b);assert.equal(merged.data.quotes.length,2);assert.equal(merged.conflicts.length,1);
+ assert.equal(Workspace.merge(merged.data,b).data.quotes.length,2);
+});
+test('preços conflitantes são avisados e a escolha converge nos aparelhos',()=>{
+ const a=Workspace.empty(),b=Workspace.empty();Workspace.updateRate(a,'S001',130);Workspace.updateRate(b,'S001',140);
+ const merged=Workspace.merge(a,b);assert.equal(merged.data.rates.S001.price,Workspace.merge(b,a).data.rates.S001.price);assert.match(merged.conflicts[0],/outra versão/);
+ assert.equal(Workspace.merge(merged.data,b).conflicts.length,0);
+});
+71:    page.locator('#save-quote').click()
+85:    page.locator('#mobile-total').click()
+86:    assert page.locator('#basket').is_visible()
+88:    page.locator('#close-basket').click()
+112:    assert page.locator('#basket-items img').count()==0
+119:    assert 'Cliente de demonstração' in page.locator('#entity-list').inner_text()
+126:    assert 'Visita de avaliação' in page.locator('#entity-list').inner_text()
+130:    assert 'Cliente de demonstração' in page.locator('#entity-list').inner_text()
+'use strict';
+const Native=(()=>{
+  let sequence=0;const pending=new Map();
+  window.altimaxReply=(id,result,error)=>{const request=pending.get(id);if(!request)return;pending.delete(id);clearTimeout(request.timer);error?request.reject(new Error(error)):request.resolve(result);};
+  async function request(method,args={}){
+    if(window.desktopBridge)return window.desktopBridge.invoke(method,args);
+    if(window.AndroidBridge){
+      return new Promise((resolve,reject)=>{const id=String(++sequence);const timer=setTimeout(()=>{pending.delete(id);reject(new Error('A operação demorou demais. Tente novamente.'));},120000);pending.set(id,{resolve,reject,timer});window.AndroidBridge.postMessage(JSON.stringify({id,method,args}));});
+    }
+    if(window.testBridge)return window.testBridge(method,args);
+    throw new Error('Abra esta tela pelo programa Windows ou pelo aplicativo Android.');
+  }
+  return {request};
+})();
+
+
+
+
+
+
+Success
+
+
+
+
+
+
+Ran python central-app/tests/interface.py
+Shell
+$python central-app/tests/interface.py
+
+
+Traceback (most recent call last):
+  File "C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX\central-app\tests\interface.py", line 119, in <module>
+    assert 'Cliente de demonstra��o' in page.locator('#entity-list').inner_text()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+
+
+
+
+
+
+Exit code 1
+
+
+
+
+
+
+
+
+
+
+
+A implementação agora grava cliente e orçamento juntos no arquivo local e guarda o ID do cliente no orçamento, sem perder os dados históricos da proposta. Também acrescentei a busca de clientes na revisão.
+No mobile, haverá um resumo visível e um painel “Ver itens e editar” com os controles já usados no Windows. Estou testando alterações de itens, recálculo, reutilização de clientes e falhas de gravação antes de gerar os novos aplicativos.
+
+
+
+
+  Ran commandsRan $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+@'
+from pathlib import Path
+Path('central-app/tests/clients.test.cjs').write_text('''const test=require('node:test'),assert=require('node:assert/strict');
+global.Quote=require('../public/quote.js');global.Workspace=require('../public/workspace.js');
+const Sync=require('../public/sync.js'),Store=require('../desktop/store.cjs');
+const draft=()=>({version:1,items:[{id:'S001',name:'Tomada',quantity:1,price:120}],client:'João da Silva',phone:'(21) 98888-7777',location:'Endereço do atendimento',reference:'TESTE',kind:'Orçamento',scope:'Troca',validity:'7 dias',schedule:'A combinar',payment:'Pix',notes:'Nota exclusiva da proposta',surchargeReason:'',minimum:120,percent:0,materials:0,travel:0,discount:0});
+const fields=(extra={})=>({name:'João da Silva',phone:'21988887777',email:'',address:'Endereço permanente',notes:'Nota do cadastro',...extra});
+test('cliente do orçamento vira cadastro e vínculo, mantendo condições apenas no orçamento',()=>{
+ const w=Workspace.empty(),r=Workspace.saveQuoteWithClient(w,draft());
+ assert.equal(w.clients.length,0);assert.equal(r.workspace.clients.length,1);
+ const c=r.workspace.clients[0],q=r.workspace.quotes[0];assert.equal(q.draft.clientId,c.id);assert.equal(c.address,draft().location);assert.equal(c.notes,'');assert.equal(q.draft.notes,draft().notes);
+ const saved=Store.parse(JSON.stringify({version:2,workspace:r.workspace,active:{id:r.id,draft:r.draft}}));assert.equal(saved.workspace.quotes[0].draft.clientId,c.id);
+ const again=Workspace.saveQuoteWithClient(saved.workspace,{...draft(),phone:'+55 (21) 98888-7777'});assert.equal(again.workspace.clients.length,1);assert.equal(again.draft.clientId,c.id);
+});
+test('cliente previamente cadastrado é reutilizado, sem alterar seu endereço permanente',()=>{
+ const w=Workspace.empty(),id=Workspace.saveClient(w,fields());
+ const r=Workspace.saveQuoteWithClient(w,{...draft(),clientId:id,location:'Outro imóvel'});assert.equal(r.workspace.clients.length,1);assert.equal(r.workspace.clients[0].address,'Endereço permanente');assert.equal(r.draft.location,'Outro imóvel');
+});
+test('mesmo contato não cria cadastro silencioso nos dois fluxos; e-mail normalizado',()=>{
+ const w=Workspace.empty();Workspace.saveClient(w,fields({email:'JOAO@EXAMPLE.INVALID'}));
+ assert.throws(()=>Workspace.saveClient(w,fields({phone:'+5521988887777'})),/já cadastrado/);
+ const r=Workspace.saveQuoteWithClient(w,{...draft(),phone:'',clientEmail:' joao@example.invalid '});assert.equal(r.workspace.clients.length,1);
+ assert.throws(()=>Workspace.saveQuoteWithClient(w,{...draft(),client:'Outra pessoa'}),/contato pertence/);
+});
+test('contatos ambíguos e nome sem identificador exigem escolha explícita; erro não altera workspace',()=>{
+ const w=Workspace.empty();Workspace.saveClient(w,fields());Workspace.saveClient(w,fields({name:'Maria',phone:'21977776666',email:'maria@example.invalid'}));const before=JSON.stringify(w);
+ assert.throws(()=>Workspace.saveQuoteWithClient(w,{...draft(),clientEmail:'maria@example.invalid'}),/cadastros diferentes/);
+ assert.throws(()=>Workspace.saveQuoteWithClient(w,{...draft(),phone:''}),/esse nome/);
+ assert.equal(JSON.stringify(w),before);
+});
+test('rascunho antigo e cliente ainda não informado continuam compatíveis',()=>{
+ const old=draft();const clean=Quote.validateDraft(old);assert.equal(clean.clientId,'');assert.equal(clean.clientEmail,'');
+ const r=Workspace.saveQuoteWithClient(Workspace.empty(),{...old,client:'',phone:''});assert.equal(r.workspace.clients.length,0);assert.equal(r.workspace.quotes.length,1);
+ const w=Workspace.empty(),id=Workspace.saveClient(w,fields());Workspace.updateEntity(w,'clients',{...w.clients[0],deleted:true},id);
+ assert.throws(()=>Workspace.saveQuoteWithClient(w,{...old,clientId:id}),/não está disponível/);
+});
+test('cliente novo via orçamento sincroniza nos dois sentidos e sobe antes da proposta',async()=>{
+ const rows=new Map(),writes=[];const call=async(action,args)=>{if(action==='pull')return {rows:structuredClone([...rows.values()]),catalog:[]};const r=args.record,k=r.kind+':'+r.id,old=rows.get(k);if((old?.revision??null)!==args.revision)return {conflict:true};const saved={...structuredClone(r),revision:(old?.revision||0)+1};rows.set(k,saved);writes.push(r.kind);return [saved];};
+ const pc=Workspace.saveQuoteWithClient(Workspace.empty(),draft());await Sync.exchange(pc.workspace,call);assert.equal(writes[0],'client');
+ const mobile=(await Sync.exchange(Workspace.empty(),call)).data;assert.equal(mobile.clients.length,1);assert.equal(mobile.quotes[0].draft.clientId,mobile.clients[0].id);
+ const second=Workspace.saveQuoteWithClient(mobile,{...draft(),clientId:mobile.clients[0].id,reference:'ORÇAMENTO B'});await Sync.exchange(second.workspace,call);
+ const back=(await Sync.exchange(pc.workspace,call)).data;assert.equal(back.clients.length,1);assert.equal(back.quotes.length,2);
+});
+test('criações independentes offline com mesmo contato geram aviso ao sincronizar',()=>{
+ const a=Workspace.saveQuoteWithClient(Workspace.empty(),draft()).workspace,b=Workspace.saveQuoteWithClient(Workspace.empty(),draft()).workspace;
+ const merged=Workspace.merge(a,b);assert.equal(merged.data.clients.length,2);assert.ok(merged.conflicts.some(c=>c.includes('contato repetido')));
+ assert.equal(Workspace.merge(merged.data,b).data.clients.length,2);
+});
+''',encoding='utf-8')
+Path('central-app/tests/quote_flows.py').write_text('''"""Critérios de aceite: UI real compartilhada, persistência offline simulada e falhas."""
+from pathlib import Path
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+from functools import partial
+from threading import Thread
+from playwright.sync_api import sync_playwright, expect
+ROOT=Path(__file__).resolve().parents[2]
+class Handler(SimpleHTTPRequestHandler):
+ def log_message(self,*args): pass
+server=ThreadingHTTPServer(('127.0.0.1',0),partial(Handler,directory=str(ROOT/'central-app/public')))
+Thread(target=server.serve_forever,daemon=True).start()
+try:
+ with sync_playwright() as p:
+  browser=p.chromium.launch(channel='msedge',headless=True)
+  context=browser.new_context(viewport={'width':390,'height':844})
+  context.add_init_script("""
+  window.failSave=false;
+  window.testBridge=async(method,args)=>{
+    if(method==='load')return {platform:'test',state:JSON.parse(localStorage.getItem('state')||'null')};
+    if(method==='save'){if(window.failSave)throw Error('Disco indisponível');localStorage.setItem('state',JSON.stringify(args.state));return {workspace:args.state.workspace};}
+    if(method==='cloud'){if(args.action==='status')return {signedIn:false};throw Error('Offline');}
+  };
+  """)
+  page=context.new_page();errors=[];page.on('pageerror',lambda e:errors.append(str(e)));page.on('dialog',lambda d:d.accept())
+  page.goto(f'http://127.0.0.1:{server.server_port}');page.wait_for_selector('.service-card')
+  def add(name,price):
+   page.locator('#custom-open').click();page.locator('#service-name').fill(name);page.locator('#service-price').fill(str(price));page.locator('#service-submit').click()
+  def review():
+   if page.viewport_size['width']<901:page.locator('#summary-open').click()
+   page.locator('#review-open').click()
+  def finish_review():
+   page.locator('#review-dialog [aria-label=Fechar]').click()
+   if page.locator('#basket-dialog').evaluate('(e)=>e.open'):page.locator('#continue-services').click()
+  def save():
+   page.locator('#save-quote').click();expect(page.locator('#quote-save-error')).to_have_text('')
+  def management():page.locator('.mobile-nav [data-view=business]' if page.viewport_size['width']<901 else '.sidebar [data-view=business]').click()
+  def builder():page.locator('.mobile-nav [data-view=builder]' if page.viewport_size['width']<901 else '.sidebar [data-view=builder]').click()
+  # 1: três itens, remover um, adicionar outro, alterar quantidade/preço.
+  for name,price in [('Serviço A',80),('Serviço B',100),('Serviço C',150)]:add(name,price)
+  expect(page.locator('#summary-items li')).to_have_count(3);expect(page.locator('#summary-total')).to_contain_text('330,00')
+  page.locator('#summary-open').click();expect(page.locator('#basket-items .basket-item')).to_have_count(3)
+  page.get_by_role('button',name='Remover Serviço B',exact=True).click();expect(page.locator('#total')).to_contain_text('230,00')
+  page.locator('#continue-services').click();add('Serviço D',90);page.locator('#mobile-total').click()
+  expect(page.locator('#basket-items .basket-item')).to_have_count(3);expect(page.locator('#total')).to_contain_text('320,00')
+  page.get_by_role('button',name='Aumentar Serviço A',exact=True).click();expect(page.locator('#total')).to_contain_text('400,00')
+  page.get_by_role('button',name='Editar Serviço A',exact=True).click();page.locator('#service-price').fill('60');page.locator('#service-submit').click();expect(page.locator('#total')).to_contain_text('360,00')
+  page.screenshot(path=str(ROOT/'aplicativos/previa-itens-mobile.png'))
+  assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
+  # 2: limpar; vazio e total zero; Escape não impede nova abertura.
+  page.locator('#new-quote').click();page.locator('#summary-open').click();expect(page.locator('#basket-items .basket-item')).to_have_count(0);expect(page.locator('#total')).to_contain_text('0,00');assert page.locator('#review-open').is_disabled()
+  page.keyboard.press('Escape');expect(page.locator('#basket-dialog')).not_to_be_visible()
+  # 3: cadastro prévio continua reutilizável pelo fluxo Gestão e pelo seletor.
+  management();page.locator('#entity-new').click()
+  for key,value in [('name','Cliente Prévio'),('phone','21988887777'),('email','previo@example.invalid'),('address','Endereço permanente')]:page.locator(f'[data-entity-field={key}]').fill(value)
+  page.locator('#entity-form button').click();expect(page.locator('#entity-dialog')).not_to_be_visible()
+  page.get_by_role('button',name='Usar no orçamento',exact=True).click();add('Serviço do prévio',120);review()
+  expect(page.locator('[data-field=client]')).to_have_value('Cliente Prévio');assert page.locator('#quote-client-select').input_value()
+  page.locator('[data-field=location]').fill('Outro imóvel');save();finish_review();management();expect(page.locator('#entity-list')).to_contain_text('Endereço permanente')
+  # 4: novo cliente via orçamento + reabertura de aplicação (gravação real no fixture).
+  builder();page.locator('#summary-open').click();page.locator('#new-quote').click();add('Serviço novo',200);review()
+  page.locator('[data-field=client]').fill('Cliente do Orçamento');page.locator('[data-field=phone]').fill('21977776666');page.locator('[data-field=location]').fill('Local novo');save();finish_review();management();expect(page.locator('#entity-list')).to_contain_text('Cliente do Orçamento')
+  page.reload();page.wait_for_selector('.service-card');management();expect(page.locator('#entity-list')).to_contain_text('Cliente do Orçamento')
+  # 5: orçamento B seleciona o mesmo ID e não gera outro cliente; desktop usa mesma camada.
+  page.set_viewport_size({'width':1380,'height':1000});builder();page.locator('#new-quote').click();add('Serviço B',180);review()
+  page.locator('#quote-client-search').fill('Cliente do Orçamento');page.locator('#quote-client-select').select_option(label='Cliente do Orçamento · 21977776666');save();finish_review()
+  assert page.evaluate("JSON.parse(localStorage.state).workspace.clients.length")==2
+  # Falha de persistência não fecha o formulário nem anuncia sucesso; retry sem duplicar.
+  management();page.locator('#entity-new').click();page.locator('[data-entity-field=name]').fill('Cliente com falha');page.locator('[data-entity-field=phone]').fill('21966665555');page.evaluate('window.failSave=true');page.locator('#entity-form button').click();expect(page.locator('#entity-error')).to_contain_text('Disco indisponível');expect(page.locator('#entity-dialog')).to_be_visible()
+  assert page.evaluate("JSON.parse(localStorage.state).workspace.clients.length")==2
+  page.evaluate('window.failSave=false');page.locator('#entity-form button').click();expect(page.locator('#entity-dialog')).not_to_be_visible();assert page.evaluate("JSON.parse(localStorage.state).workspace.clients.length")==3
+  # Cadastro direto rejeita duplicata pelo telefone no formato internacional.
+  page.locator('#entity-new').click();page.locator('[data-entity-field=name]').fill('Cliente duplicado');page.locator('[data-entity-field=phone]').fill('+55 21 96666-5555');page.locator('#entity-form button').click();expect(page.locator('#entity-error')).to_contain_text('já cadastrado');page.locator('#entity-dialog [aria-label=Fechar]').click()
+  assert not errors,errors
+  browser.close();print('PASS: cenários mobile 1-5, edição, vazio, offline, clientes, recarga, duplicidade e falha/retry de gravação')
+finally:server.shutdown();server.server_close()
+''',encoding='utf-8')
+'@ | python -
+npm test --prefix central-app
+Shell
+$$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+@'
+from pathlib import Path
+Path('central-app/tests/clients.test.cjs').write_text('"'''"'const test=require('node:test'),assert=require('node:assert/strict');
+global.Quote=require('../public/quote.js');global.Workspace=require('../public/workspace.js');
+const Sync=require('../public/sync.js'),Store=require('../desktop/store.cjs');
+const draft=()=>({version:1,items:[{id:'S001',name:'Tomada',quantity:1,price:120}],client:'João da Silva',phone:'(21) 98888-7777',location:'Endereço do atendimento',reference:'TESTE',kind:'Orçamento',scope:'Troca',validity:'7 dias',schedule:'A combinar',payment:'Pix',notes:'Nota exclusiva da proposta',surchargeReason:'"''"',minimum:120,percent:0,materials:0,travel:0,discount:0});
+const fields=(extra={})=>({name:'João da Silva',phone:'21988887777',email:'"''"',address:'Endereço permanente',notes:'Nota do cadastro',...extra});
+test('cliente do orçamento vira cadastro e vínculo, mantendo condições apenas no orçamento',()=>{
+ const w=Workspace.empty(),r=Workspace.saveQuoteWithClient(w,draft());
+ assert.equal(w.clients.length,0);assert.equal(r.workspace.clients.length,1);
+ const c=r.workspace.clients[0],q=r.workspace.quotes[0];assert.equal(q.draft.clientId,c.id);assert.equal(c.address,draft().location);assert.equal(c.notes,'"''"');assert.equal(q.draft.notes,draft().notes);
+ const saved=Store.parse(JSON.stringify({version:2,workspace:r.workspace,active:{id:r.id,draft:r.draft}}));assert.equal(saved.workspace.quotes[0].draft.clientId,c.id);
+ const again=Workspace.saveQuoteWithClient(saved.workspace,{...draft(),phone:'+55 (21) 98888-7777'});assert.equal(again.workspace.clients.length,1);assert.equal(again.draft.clientId,c.id);
+});
+test('cliente previamente cadastrado é reutilizado, sem alterar seu endereço permanente',()=>{
+ const w=Workspace.empty(),id=Workspace.saveClient(w,fields());
+ const r=Workspace.saveQuoteWithClient(w,{...draft(),clientId:id,location:'Outro imóvel'});assert.equal(r.workspace.clients.length,1);assert.equal(r.workspace.clients[0].address,'Endereço permanente');assert.equal(r.draft.location,'Outro imóvel');
+});
+test('mesmo contato não cria cadastro silencioso nos dois fluxos; e-mail normalizado',()=>{
+ const w=Workspace.empty();Workspace.saveClient(w,fields({email:'JOAO@EXAMPLE.INVALID'}));
+ assert.throws(()=>Workspace.saveClient(w,fields({phone:'+5521988887777'})),/já cadastrado/);
+ const r=Workspace.saveQuoteWithClient(w,{...draft(),phone:'"''"',clientEmail:' joao@example.invalid '});assert.equal(r.workspace.clients.length,1);
+ assert.throws(()=>Workspace.saveQuoteWithClient(w,{...draft(),client:'Outra pessoa'}),/contato pertence/);
+});
+test('contatos ambíguos e nome sem identificador exigem escolha explícita; erro não altera workspace',()=>{
+ const w=Workspace.empty();Workspace.saveClient(w,fields());Workspace.saveClient(w,fields({name:'Maria',phone:'21977776666',email:'maria@example.invalid'}));const before=JSON.stringify(w);
+ assert.throws(()=>Workspace.saveQuoteWithClient(w,{...draft(),clientEmail:'maria@example.invalid'}),/cadastros diferentes/);
+ assert.throws(()=>Workspace.saveQuoteWithClient(w,{...draft(),phone:'"''"'}),/esse nome/);
+ assert.equal(JSON.stringify(w),before);
+});
+test('rascunho antigo e cliente ainda não informado continuam compatíveis',()=>{
+ const old=draft();const clean=Quote.validateDraft(old);assert.equal(clean.clientId,'"''"');assert.equal(clean.clientEmail,'"''"');
+ const r=Workspace.saveQuoteWithClient(Workspace.empty(),{...old,client:'"''"',phone:'"''"'});assert.equal(r.workspace.clients.length,0);assert.equal(r.workspace.quotes.length,1);
+ const w=Workspace.empty(),id=Workspace.saveClient(w,fields());Workspace.updateEntity(w,'clients',{...w.clients[0],deleted:true},id);
+ assert.throws(()=>Workspace.saveQuoteWithClient(w,{...old,clientId:id}),/não está disponível/);
+});
+test('cliente novo via orçamento sincroniza nos dois sentidos e sobe antes da proposta',async()=>{
+ const rows=new Map(),writes=[];const call=async(action,args)=>{if(action==='pull')return {rows:structuredClone([...rows.values()]),catalog:[]};const r=args.record,k=r.kind+':'+r.id,old=rows.get(k);if((old?.revision??null)!==args.revision)return {conflict:true};const saved={...structuredClone(r),revision:(old?.revision||0)+1};rows.set(k,saved);writes.push(r.kind);return [saved];};
+ const pc=Workspace.saveQuoteWithClient(Workspace.empty(),draft());await Sync.exchange(pc.workspace,call);assert.equal(writes[0],'client');
+ const mobile=(await Sync.exchange(Workspace.empty(),call)).data;assert.equal(mobile.clients.length,1);assert.equal(mobile.quotes[0].draft.clientId,mobile.clients[0].id);
+ const second=Workspace.saveQuoteWithClient(mobile,{...draft(),clientId:mobile.clients[0].id,reference:'ORÇAMENTO B'});await Sync.exchange(second.workspace,call);
+ const back=(await Sync.exchange(pc.workspace,call)).data;assert.equal(back.clients.length,1);assert.equal(back.quotes.length,2);
+});
+test('criações independentes offline com mesmo contato geram aviso ao sincronizar',()=>{
+ const a=Workspace.saveQuoteWithClient(Workspace.empty(),draft()).workspace,b=Workspace.saveQuoteWithClient(Workspace.empty(),draft()).workspace;
+ const merged=Workspace.merge(a,b);assert.equal(merged.data.clients.length,2);assert.ok(merged.conflicts.some(c=>c.includes('contato repetido')));
+ assert.equal(Workspace.merge(merged.data,b).data.clients.length,2);
+});
+'"'''"',encoding='utf-8')
+Path('central-app/tests/quote_flows.py').write_text('"'''"'"""Critérios de aceite: UI real compartilhada, persistência offline simulada e falhas."""
+from pathlib import Path
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+from functools import partial
+from threading import Thread
+from playwright.sync_api import sync_playwright, expect
+ROOT=Path(__file__).resolve().parents[2]
+class Handler(SimpleHTTPRequestHandler):
+ def log_message(self,*args): pass
+server=ThreadingHTTPServer(('127.0.0.1',0),partial(Handler,directory=str(ROOT/'central-app/public')))
+Thread(target=server.serve_forever,daemon=True).start()
+try:
+ with sync_playwright() as p:
+  browser=p.chromium.launch(channel='msedge',headless=True)
+  context=browser.new_context(viewport={'width':390,'height':844})
+  context.add_init_script("""
+  window.failSave=false;
+  window.testBridge=async(method,args)=>{
+    if(method==='load')return {platform:'test',state:JSON.parse(localStorage.getItem('state')||'null')};
+    if(method==='save'){if(window.failSave)throw Error('Disco indisponível');localStorage.setItem('state',JSON.stringify(args.state));return {workspace:args.state.workspace};}
+    if(method==='cloud'){if(args.action==='status')return {signedIn:false};throw Error('Offline');}
+  };
+  """)
+  page=context.new_page();errors=[];page.on('pageerror',lambda e:errors.append(str(e)));page.on('dialog',lambda d:d.accept())
+  page.goto(f'http://127.0.0.1:{server.server_port}');page.wait_for_selector('.service-card')
+  def add(name,price):
+   page.locator('#custom-open').click();page.locator('#service-name').fill(name);page.locator('#service-price').fill(str(price));page.locator('#service-submit').click()
+  def review():
+   if page.viewport_size['width']<901:page.locator('#summary-open').click()
+   page.locator('#review-open').click()
+  def finish_review():
+   page.locator('#review-dialog [aria-label=Fechar]').click()
+   if page.locator('#basket-dialog').evaluate('(e)=>e.open'):page.locator('#continue-services').click()
+  def save():
+   page.locator('#save-quote').click();expect(page.locator('#quote-save-error')).to_have_text('"''"')
+  def management():page.locator('.mobile-nav [data-view=business]' if page.viewport_size['width']<901 else '.sidebar [data-view=business]').click()
+  def builder():page.locator('.mobile-nav [data-view=builder]' if page.viewport_size['width']<901 else '.sidebar [data-view=builder]').click()
+  # 1: três itens, remover um, adicionar outro, alterar quantidade/preço.
+  for name,price in [('Serviço A',80),('Serviço B',100),('Serviço C',150)]:add(name,price)
+  expect(page.locator('#summary-items li')).to_have_count(3);expect(page.locator('#summary-total')).to_contain_text('330,00')
+  page.locator('#summary-open').click();expect(page.locator('#basket-items .basket-item')).to_have_count(3)
+  page.get_by_role('button',name='Remover Serviço B',exact=True).click();expect(page.locator('#total')).to_contain_text('230,00')
+  page.locator('#continue-services').click();add('Serviço D',90);page.locator('#mobile-total').click()
+  expect(page.locator('#basket-items .basket-item')).to_have_count(3);expect(page.locator('#total')).to_contain_text('320,00')
+  page.get_by_role('button',name='Aumentar Serviço A',exact=True).click();expect(page.locator('#total')).to_contain_text('400,00')
+  page.get_by_role('button',name='Editar Serviço A',exact=True).click();page.locator('#service-price').fill('60');page.locator('#service-submit').click();expect(page.locator('#total')).to_contain_text('360,00')
+  page.screenshot(path=str(ROOT/'aplicativos/previa-itens-mobile.png'))
+  assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
+  # 2: limpar; vazio e total zero; Escape não impede nova abertura.
+  page.locator('#new-quote').click();page.locator('#summary-open').click();expect(page.locator('#basket-items .basket-item')).to_have_count(0);expect(page.locator('#total')).to_contain_text('0,00');assert page.locator('#review-open').is_disabled()
+  page.keyboard.press('Escape');expect(page.locator('#basket-dialog')).not_to_be_visible()
+  # 3: cadastro prévio continua reutilizável pelo fluxo Gestão e pelo seletor.
+  management();page.locator('#entity-new').click()
+  for key,value in [('name','Cliente Prévio'),('phone','21988887777'),('email','previo@example.invalid'),('address','Endereço permanente')]:page.locator(f'[data-entity-field={key}]').fill(value)
+  page.locator('#entity-form button').click();expect(page.locator('#entity-dialog')).not_to_be_visible()
+  page.get_by_role('button',name='Usar no orçamento',exact=True).click();add('Serviço do prévio',120);review()
+  expect(page.locator('[data-field=client]')).to_have_value('Cliente Prévio');assert page.locator('#quote-client-select').input_value()
+  page.locator('[data-field=location]').fill('Outro imóvel');save();finish_review();management();expect(page.locator('#entity-list')).to_contain_text('Endereço permanente')
+  # 4: novo cliente via orçamento + reabertura de aplicação (gravação real no fixture).
+  builder();page.locator('#summary-open').click();page.locator('#new-quote').click();add('Serviço novo',200);review()
+  page.locator('[data-field=client]').fill('Cliente do Orçamento');page.locator('[data-field=phone]').fill('21977776666');page.locator('[data-field=location]').fill('Local novo');save();finish_review();management();expect(page.locator('#entity-list')).to_contain_text('Cliente do Orçamento')
+  page.reload();page.wait_for_selector('.service-card');management();expect(page.locator('#entity-list')).to_contain_text('Cliente do Orçamento')
+  # 5: orçamento B seleciona o mesmo ID e não gera outro cliente; desktop usa mesma camada.
+  page.set_viewport_size({'width':1380,'height':1000});builder();page.locator('#new-quote').click();add('Serviço B',180);review()
+  page.locator('#quote-client-search').fill('Cliente do Orçamento');page.locator('#quote-client-select').select_option(label='Cliente do Orçamento · 21977776666');save();finish_review()
+  assert page.evaluate("JSON.parse(localStorage.state).workspace.clients.length")==2
+  # Falha de persistência não fecha o formulário nem anuncia sucesso; retry sem duplicar.
+  management();page.locator('#entity-new').click();page.locator('[data-entity-field=name]').fill('Cliente com falha');page.locator('[data-entity-field=phone]').fill('21966665555');page.evaluate('window.failSave=true');page.locator('#entity-form button').click();expect(page.locator('#entity-error')).to_contain_text('Disco indisponível');expect(page.locator('#entity-dialog')).to_be_visible()
+  assert page.evaluate("JSON.parse(localStorage.state).workspace.clients.length")==2
+  page.evaluate('window.failSave=false');page.locator('#entity-form button').click();expect(page.locator('#entity-dialog')).not_to_be_visible();assert page.evaluate("JSON.parse(localStorage.state).workspace.clients.length")==3
+  # Cadastro direto rejeita duplicata pelo telefone no formato internacional.
+  page.locator('#entity-new').click();page.locator('[data-entity-field=name]').fill('Cliente duplicado');page.locator('[data-entity-field=phone]').fill('+55 21 96666-5555');page.locator('#entity-form button').click();expect(page.locator('#entity-error')).to_contain_text('já cadastrado');page.locator('#entity-dialog [aria-label=Fechar]').click()
+  assert not errors,errors
+  browser.close();print('PASS: cenários mobile 1-5, edição, vazio, offline, clientes, recarga, duplicidade e falha/retry de gravação')
+finally:server.shutdown();server.server_close()
+'"'''"',encoding='utf-8')
+'@ | python -
+npm test --prefix central-app
+
+
+
+> altimax-orcamentos@2.0.3 test
+> node --test tests/*.test.cjs
+
+✔ cliente do orçamento vira cadastro e vínculo, mantendo condições apenas no orçamento (22.869ms)
+✔ cliente previamente cadastrado é reutilizado, sem alterar seu endereço permanente (3.1685ms)
+✔ mesmo contato não cria cadastro silencioso nos dois fluxos; e-mail normalizado (2.5652ms)
+✔ contatos ambíguos e nome sem identificador exigem escolha explícita; erro não altera workspace (1.6034ms)
+✔ rascunho antigo e cliente ainda não informado continuam compatíveis (0.7986ms)
+✔ cliente novo via orçamento sincroniza nos dois sentidos e sobe antes da proposta (53.7227ms)
+✔ criações independentes offline com mesmo contato geram aviso ao sincronizar (1.5758ms)
+✔ erros de autenticação são traduzidos sem expor detalhes arbitrários (2.3155ms)
+✔ transporte nativo limita destino, protege credenciais e recusa troca de proprietário (28.9141ms)
+✔ falha HTTP não devolve corpo de erro com tokens ou detalhes internos (4.2446ms)
+✔ recupera conta excluída somente após autenticar e autorizar a nova conta (5.5683ms)
+✔ PC e Android compartilham clientes, relatórios, preços, agenda e pagamentos (24.5535ms)
+✔ edição simultânea converge e preserva as duas versões (2.9498ms)
+✔ perda da resposta depois da gravação não duplica registros (1.5962ms)
+✔ arquivamento se propaga sem ressuscitar versão antiga offline (4.4965ms)
+✔ conflito durante gravação provoca nova leitura antes de tentar novamente (4.5614ms)
+✔ dados inválidos do servidor não substituem dados locais (2.7084ms)
+✔ mínimo único, centavos e adicional somente na mão de obra (7.5187ms)
+✔ importação idempotente e edição descendente atualiza orçamento (17.4504ms)
+✔ edições independentes preservam ambas sem duplicar a cada importação (55.7638ms)
+✔ preços conflitantes são avisados e a escolha converge nos aparelhos (12.045ms)
+✔ entrada inválida é rejeitada antes de alterar o arquivo (101.9408ms)
+✔ somente endereço de WhatsApp permitido no sistema operacional (1.25ms)
+ℹ tests 23
+ℹ suites 0
+ℹ pass 23
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 685.9736
+
+
+
+
+
+
+Success
+
+
+
+
+
+
+Ran python central-app/tests/quote_flows.py
+Shell
+$python central-app/tests/quote_flows.py
+
+
+PASS: cen�rios mobile 1-5, edi��o, vazio, offline, clientes, recarga, duplicidade e falha/retry de grava��o
+
+
+
+
+
+
+Success
+
+
+
+
+
+
+Ran $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+@'
+from pathlib import Path
+p=Path('central-app/public/index.html');s=p.read_text(encoding='utf-8').replace('<button id="save-quick"','<p id="basket-save-error" role="alert"></p><button id="save-quick"',1);p.write_text(s,encoding='utf-8')
+p=Path('central-app/public/app.js');s=p.read_text(encoding='utf-8').replace("$('sync-state').textContent='Falha ao salvar';toast(e.message+' Exporte um backup.');","$('sync-state').textContent='Falha ao salvar';$('basket-save-error').textContent=e.message+' Não foi possível gravar. Tente novamente ou exporte um backup.';toast(e.message+' Exporte um backup.');").replace("$('quote-save-error').textContent='Salvando cliente e orçamento…';","$('quote-save-error').textContent='Salvando cliente e orçamento…';$('basket-save-error').textContent='Salvando…';").replace("$('quote-save-error').textContent='';toast('Orçamento e cliente", "$('quote-save-error').textContent='';$('basket-save-error').textContent='';toast('Orçamento e cliente").replace("$('quote-save-error').textContent=e.message+' Confira os dados e tente salvar novamente.';throw e;","$('quote-save-error').textContent=e.message+' Confira os dados e tente salvar novamente.';$('basket-save-error').textContent=$('quote-save-error').textContent;throw e;")
+p.write_text(s,encoding='utf-8')
+p=Path('central-app/public/app.css');s=p.read_text(encoding='utf-8').replace('#quote-save-error,#client-duplicates{','#quote-save-error,#basket-save-error,#client-duplicates{');p.write_text(s,encoding='utf-8')
+p=Path('central-app/tests/interface.py');s=p.read_text(encoding='utf-8').replace("page.locator('#entity-form .primary').click()","page.locator('#entity-form .primary').click()\n    page.wait_for_function(\"!document.getElementById('entity-dialog').open\")");p.write_text(s,encoding='utf-8')
+for f in ['central-app/package.json','central-app/package-lock.json']:
+ p=Path(f);s=p.read_text(encoding='utf-8').replace('2.0.3','2.1.0');p.write_text(s,encoding='utf-8')
+p=Path('central-app/android/app/build.gradle');s=p.read_text(encoding='utf-8').replace('versionCode 5','versionCode 6').replace('2.0.3','2.1.0');p.write_text(s,encoding='utf-8')
+'@ | python -
+python scripts/preparar_aplicativos.py
+python central-app/tests/interface.py
+Shell
+$$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+@'
+from pathlib import Path
+p=Path('central-app/public/index.html');s=p.read_text(encoding='utf-8').replace('<button id="save-quick"','<p id="basket-save-error" role="alert"></p><button id="save-quick"',1);p.write_text(s,encoding='utf-8')
+p=Path('central-app/public/app.js');s=p.read_text(encoding='utf-8').replace("$('sync-state').textContent='Falha ao salvar';toast(e.message+' Exporte um backup.');","$('sync-state').textContent='Falha ao salvar';$('basket-save-error').textContent=e.message+' Não foi possível gravar. Tente novamente ou exporte um backup.';toast(e.message+' Exporte um backup.');").replace("$('quote-save-error').textContent='Salvando cliente e orçamento…';","$('quote-save-error').textContent='Salvando cliente e orçamento…';$('basket-save-error').textContent='Salvando…';").replace("$('quote-save-error').textContent='"''"';toast('Orçamento e cliente", "$('quote-save-error').textContent='"''"';$('basket-save-error').textContent='"''"';toast('Orçamento e cliente").replace("$('quote-save-error').textContent=e.message+' Confira os dados e tente salvar novamente.';throw e;","$('quote-save-error').textContent=e.message+' Confira os dados e tente salvar novamente.';$('basket-save-error').textContent=$('quote-save-error').textContent;throw e;")
+p.write_text(s,encoding='utf-8')
+p=Path('central-app/public/app.css');s=p.read_text(encoding='utf-8').replace('#quote-save-error,#client-duplicates{','#quote-save-error,#basket-save-error,#client-duplicates{');p.write_text(s,encoding='utf-8')
+p=Path('central-app/tests/interface.py');s=p.read_text(encoding='utf-8').replace("page.locator('#entity-form .primary').click()","page.locator('#entity-form .primary').click()\n    page.wait_for_function(\"!document.getElementById('entity-dialog').open\")");p.write_text(s,encoding='utf-8')
+for f in ['central-app/package.json','central-app/package-lock.json']:
+ p=Path(f);s=p.read_text(encoding='utf-8').replace('2.0.3','2.1.0');p.write_text(s,encoding='utf-8')
+p=Path('central-app/android/app/build.gradle');s=p.read_text(encoding='utf-8').replace('versionCode 5','versionCode 6').replace('2.0.3','2.1.0');p.write_text(s,encoding='utf-8')
+'@ | python -
+python scripts/preparar_aplicativos.py
+python central-app/tests/interface.py
+
+
+Cat�logo, c�lculo, �cones e recursos locais do Android atualizados.
+Traceback (most recent call last):
+  File "C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX\central-app\tests\interface.py", line 119, in <module>
+    page.wait_for_function("!document.getElementById('entity-dialog').open")
+    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\RTEC\AppData\Roaming\Python\Python314\site-packages\playwright\sync_api\_generated.py", line 12809, in wait_for_function
+    self._sync(
+    ~~~~~~~~~~^
+        self._impl_obj.wait_for_function(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<4 lines>...
+        )
+        ^
+    )
+    ^
+  File "C:\Users\RTEC\AppData\Roaming\Python\Python314\site-packages\playwright\_impl\_sync_base.py", line 115, in _sync
+    return task.result()
+           ~~~~~~~~~~~^^
+  File "C:\Users\RTEC\AppData\Roaming\Python\Python314\site-packages\playwright\_impl\_page.py", line 1153, in wait_for_function
+    return await self._main_frame.wait_for_function(**locals_to_params(locals()))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\RTEC\AppData\Roaming\Python\Python314\site-packages\playwright\_impl\_frame.py", line 941, in wait_for_function
+    await self._channel.send("waitForFunction", self._timeout, params)
+  File "C:\Users\RTEC\AppData\Roaming\Python\Python314\site-packages\playwright\_impl\_connection.py", line 76, in send
+    return await self._connection.wrap_api_call(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<3 lines>...
+    )
+    ^
+  File "C:\Users\RTEC\AppData\Roaming\Python\Python314\site-packages\playwright\_impl\_connection.py", line 632, in wrap_api_call
+    raise rewrite_error(error, f"{parsed_st['apiName']}: {error}") from None
+playwright._impl._errors.Error: Page.wait_for_function: EvalError: Evaluating a string as JavaScript violates the following Content Security Policy directive because 'unsafe-eval' is not an allowed source of script: script-src 'self'".
+
+    at eval (<anonymous>)
+    at predicate (eval at evaluate (:311:30), <anonymous>:4:60)
+    at next (eval at evaluate (:311:30), <anonymous>:29:33)
+
+
+
+
+
+
+Exit code 1
+
+
+
+
+
+
+
+
+
+
+
+Viewed an image
+
+
+
+
+
+
+
+  Ran commandsRan npm run build:windows --prefix central-app
+Shell
+$npm run build:windows --prefix central-app
+
+
+
+> altimax-orcamentos@2.1.0 build:windows
+> electron-builder --win portable --x64
+
+  • electron-builder  version=26.15.3 os=10.0.19045
+  • loaded configuration  file=package.json ("build" field)
+  • executing @electron/rebuild  electronVersion=44.4.5 arch=x64 buildFromSource=false workspaceRoot=C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX\central-app projectDir=./ appDir=./
+  • installing native dependencies  arch=x64
+  • completed installing native dependencies
+  • packaging       platform=win32 arch=x64 electron=44.4.5 appOutDir=release\win-unpacked
+  • downloaded      label=electron progress=100%
+  • downloaded electron zip extracted successfully  output=C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX\central-app\release\win-unpacked
+  • searching for node modules  pm=npm searchDir=C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX\central-app
+  • searching for node modules  pm=traversal searchDir=C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX\central-app
+  • using manual traversal of node_modules to build dependency tree
+  • no node modules returned while searching directories  searchDirectories=[""]
+  • updating asar integrity executable resource  executablePath=release\win-unpacked\ALTIMAX Orçamentos.exe
+  • executable resource editing and code signing skipped — signAndEditExecutable is false. To skip only code signing while keeping icon and metadata applied, use signExecutable: false instead.  exe=release\win-unpacked\ALTIMAX Orçamentos.exe
+  • building        target=portable file=release\ALTIMAX-Orcamentos-Windows.exe archs=x64
+  • signing with signtool.exe  path=release\ALTIMAX-Orcamentos-Windows.exe
+
+
+
+
+
+
+Success
+
+
+
+
+
+
+Ran & central-app/android/build-release.ps1
+Shell
+$& central-app/android/build-release.ps1
+
+
+
+C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX>if "Windows_NT" == "Windows_NT" setlocal
+
+C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX>set DIRNAME=C:\Users\RTEC\AppData\Local\ALTIMAX-Build\gradle-8.13\bin\ 
+
+C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX>if "C:\Users\RTEC\AppData\Local\ALTIMAX-Build\gradle-8.13\bin\" == "" set DIRNAME=. 
+
+C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX>set APP_BASE_NAME=gradle 
+
+C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX>set APP_HOME=C:\Users\RTEC\AppData\Local\ALTIMAX-Build\gradle-8.13\bin\.. 
+
+C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX>for %i in ("C:\Users\RTEC\AppData\Local\ALTIMAX-Build\gradle-8.13\bin\..") do set APP_HOME=%~fi 
+
+C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX>set APP_HOME=C:\Users\RTEC\AppData\Local\ALTIMAX-Build\gradle-8.13 
+
+C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX>set DEFAULT_JVM_OPTS="-Xmx64m" "-Xms64m" "-javaagent:C:\Users\RTEC\AppData\Local\ALTIMAX-Build\gradle-8.13/lib/agents/gradle-instrumentation-agent-8.13.jar" 
+
+C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX>if defined JAVA_HOME goto findJavaFromJavaHome 
+
+C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX>set JAVA_HOME=C:\Program Files\Eclipse Adoptium\jdk-21.0.10.7-hotspot 
+
+C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX>set JAVA_EXE=C:\Program Files\Eclipse Adoptium\jdk-21.0.10.7-hotspot/bin/java.exe 
+
+C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX>if exist "C:\Program Files\Eclipse Adoptium\jdk-21.0.10.7-hotspot/bin/java.exe" goto execute 
+
+C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX>set CLASSPATH=C:\Users\RTEC\AppData\Local\ALTIMAX-Build\gradle-8.13\lib\gradle-gradle-cli-main-8.13.jar 
+
+C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX>"C:\Program Files\Eclipse Adoptium\jdk-21.0.10.7-hotspot/bin/java.exe" "-Xmx64m" "-Xms64m" "-javaagent:C:\Users\RTEC\AppData\Local\ALTIMAX-Build\gradle-8.13/lib/agents/gradle-instrumentation-agent-8.13.jar"   "-Dorg.gradle.appname=gradle" -classpath "C:\Users\RTEC\AppData\Local\ALTIMAX-Build\gradle-8.13\lib\gradle-gradle-cli-main-8.13.jar" org.gradle.launcher.GradleMain -p "C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX\central-app\android" assembleRelease --console plain --no-daemon 
+To honour the JVM settings for this build a single-use Daemon process will be forked. For more on this, please refer to https://docs.gradle.org/8.13/userguide/gradle_daemon.html#sec:disabling_the_daemon in the Gradle documentation.
+Daemon will be stopped at the end of the build 
+> Task :app:preBuild UP-TO-DATE
+> Task :app:preReleaseBuild UP-TO-DATE
+> Task :app:mergeReleaseJniLibFolders UP-TO-DATE
+> Task :app:mergeReleaseNativeLibs NO-SOURCE
+> Task :app:stripReleaseDebugSymbols NO-SOURCE
+> Task :app:extractReleaseNativeSymbolTables NO-SOURCE
+> Task :app:mergeReleaseNativeDebugMetadata NO-SOURCE
+> Task :app:checkReleaseDuplicateClasses UP-TO-DATE
+> Task :app:generateReleaseBuildConfig
+> Task :app:javaPreCompileRelease UP-TO-DATE
+> Task :app:checkReleaseAarMetadata UP-TO-DATE
+> Task :app:generateReleaseResValues UP-TO-DATE
+> Task :app:mapReleaseSourceSetPaths UP-TO-DATE
+> Task :app:generateReleaseResources UP-TO-DATE
+> Task :app:mergeReleaseResources UP-TO-DATE
+> Task :app:packageReleaseResources UP-TO-DATE
+> Task :app:parseReleaseLocalResources UP-TO-DATE
+> Task :app:createReleaseCompatibleScreenManifests
+> Task :app:extractDeepLinksRelease UP-TO-DATE
+> Task :app:processReleaseMainManifest
+> Task :app:processReleaseManifest
+> Task :app:processReleaseManifestForPackage
+> Task :app:desugarReleaseFileDependencies UP-TO-DATE
+> Task :app:mergeReleaseStartupProfile UP-TO-DATE
+> Task :app:mergeExtDexRelease UP-TO-DATE
+> Task :app:mergeReleaseArtProfile UP-TO-DATE
+> Task :app:mergeReleaseShaders UP-TO-DATE
+> Task :app:compileReleaseShaders NO-SOURCE
+> Task :app:generateReleaseAssets UP-TO-DATE
+> Task :app:mergeReleaseAssets
+> Task :app:extractReleaseVersionControlInfo UP-TO-DATE
+> Task :app:extractProguardFiles UP-TO-DATE
+> Task :app:processReleaseJavaRes NO-SOURCE
+> Task :app:mergeReleaseJavaResource UP-TO-DATE
+> Task :app:collectReleaseDependencies UP-TO-DATE
+> Task :app:sdkReleaseDependencyData UP-TO-DATE
+> Task :app:validateSigningRelease UP-TO-DATE
+> Task :app:writeReleaseAppMetadata UP-TO-DATE
+> Task :app:writeReleaseSigningConfigVersions UP-TO-DATE
+> Task :app:compressReleaseAssets
+> Task :app:processReleaseResources
+
+> Task :app:compileReleaseJavaWithJavac
+Note: C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX\central-app\android\app\src\main\java\br\com\altimax\orcamentos\MainActivity.java uses or overrides a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+
+> Task :app:dexBuilderRelease
+> Task :app:mergeReleaseGlobalSynthetics UP-TO-DATE
+> Task :app:generateReleaseLintVitalReportModel
+> Task :app:mergeDexRelease
+> Task :app:compileReleaseArtProfile
+> Task :app:optimizeReleaseResources
+> Task :app:lintVitalAnalyzeRelease
+> Task :app:lintVitalReportRelease
+> Task :app:lintVitalRelease
+> Task :app:packageRelease
+> Task :app:createReleaseApkListingFileRedirect
+> Task :app:assembleRelease
+
+[Incubating] Problems report is available at: file:///C:/Users/RTEC/Documents/ALTIMAX/EMPRESA%20DE%20ELETRICA/VSCODECODEX/central-app/android/build/reports/problems/problems-report.html
+
+Deprecated Gradle features were used in this build, making it incompatible with Gradle 9.0.
+
+You can use '--warning-mode all' to show the individual deprecation warnings and determine if they come from your own scripts or plugins.
+
+For more on this, please refer to https://docs.gradle.org/8.13/userguide/command_line_interface.html#sec:command_line_warnings in the Gradle documentation.
+
+BUILD SUCCESSFUL in 46s
+44 actionable tasks: 19 executed, 25 up-to-date
+
+C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX>if 0 EQU 0 goto mainEnd 
+
+C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX>if "Windows_NT" == "Windows_NT" endlocal
+
+
+
+
+
+
+Success
+
+
+
+
+
+
+Ran rg -n 'debug|WebView|setWeb' central-app/android/app/src/main/java/br/com/altimax/orcamentos/MainActivity.java
+& "$env:LOCALAPPDATA/Android/Sdk/platform-tools/adb.exe" devices
+Get-ChildItem "$env:USERPROFILE/.android/avd" -Name
+Get-Content -Encoding UTF8 central-app/tests/windows.py | Select-Object -Last 15
+Shell
+$rg -n 'debug|WebView|setWeb' central-app/android/app/src/main/java/br/com/altimax/orcamentos/MainActivity.java
+& "$env:LOCALAPPDATA/Android/Sdk/platform-tools/adb.exe" devices
+Get-ChildItem "$env:USERPROFILE/.android/avd" -Name
+Get-Content -Encoding UTF8 central-app/tests/windows.py | Select-Object -Last 15
+
+
+22:import android.webkit.WebView;
+23:import android.webkit.WebViewClient;
+36:    private WebView web;
+50:        web = new WebView(this);
+62:        WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG);
+73:        web.setWebViewClient(new WebViewClient(){
+74:            @Override public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request){return !request.getUrl().toString().startsWith(ORIGIN+"/");}
+75:            @Override public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request){
+87:        web.setWebChromeClient(new WebChromeClient(){
+88:            @Override public boolean onJsConfirm(WebView v,String url,String message,JsResult result){new AlertDialog.Builder(MainActivity.this).setMessage(message).setPositiveButton("Continuar",(d,w)->result.confirm()).setNegativeButton("Cancelar",(d,w)->result.cancel()).setOnCancelListener(d->result.cancel()).show();return true;}
+List of devices attached
+
+Medium_Phone.avd
+Medium_Phone_API_36.0.ini
+        assert '120,00' in page.locator('#total').inner_text()
+        encrypted=(Path(temp)/'orcamentos.json').read_bytes()
+        assert encrypted.startswith(b'ALT2\0')
+        assert b'"workspace"' not in encrypted
+        page.reload();page.wait_for_selector('.service-card')
+        assert '120,00' in page.locator('#total').inner_text()
+        assert page.evaluate("fetch('https://example.com').then(()=>false).catch(()=>true)")
+        assert page.evaluate("window.desktopBridge.invoke('invalid').then(()=>false).catch(()=>true)")
+        assert page.evaluate("window.desktopBridge.invoke('whatsapp',{url:'file:///C:/Windows/system32/cmd.exe'}).then(()=>false).catch(()=>true)")
+        page.evaluate('window.altimaxFlush()')
+        print('PASS: Electron nativo, persistência em disco, sandbox, isolamento e bloqueio de rede/URLs indevidas.')
+        browser.close()
+    finally:
+        subprocess.run(['taskkill','/PID',str(proc.pid),'/T','/F'],capture_output=True)
+        proc.wait(timeout=20)
+
+
+
+
+
+
+Success
+
+
+
+
+
+
+Ran python central-app/tests/windows.py
+python central-app/tests/quote_flows.py
+python scripts/verificar.py
+Shell
+$python central-app/tests/windows.py
+python central-app/tests/quote_flows.py
+python scripts/verificar.py
+
+
+PASS: Electron nativo, persist�ncia em disco, sandbox, isolamento e bloqueio de rede/URLs indevidas.
+PASS: cen�rios mobile 1-5, edi��o, vazio, offline, clientes, recarga, duplicidade e falha/retry de grava��o
+PASS: 19 verifica��es; 175 servi�os; refer�ncias locais sem falhas.
+
+
+
+
+
+
+Success
+
+
+
+
+
+
+Ran Get-Content -Encoding UTF8 central-app/tests/interface.py | Select-Object -Skip 100 -First 37
+Shell
+$Get-Content -Encoding UTF8 central-app/tests/interface.py | Select-Object -Skip 100 -First 37
+
+
+    assert '290,00' in other.locator('.saved-card').inner_text()
+    # Invalid files do not replace saved data.
+    other.evaluate('window.imported=\'{"version":2,"quotes":[],"rates":{"__proto__":{}}}\'')
+    other.locator('#restore').click()
+    assert other.locator('.saved-card').count()==1
+    # No price is invented for a service outside the pilot references.
+    page.set_viewport_size({'width':1380,'height':1000})
+    page.locator('#custom-open').click()
+    page.locator('#service-name').fill('<img src=x onerror=alert(1)>')
+    page.locator('#service-price').fill('75.50')
+    page.locator('#service-submit').click()
+    assert page.locator('#basket-items img').count()==0
+    page.locator('.sidebar [data-view=business]').click()
+    page.locator('#entity-new').click()
+    page.locator('[data-entity-field=name]').fill('Cliente de demonstração')
+    page.locator('[data-entity-field=phone]').fill('21999999999')
+    page.locator('[data-entity-field=address]').fill('Paciência')
+    page.locator('#entity-form .primary').click()
+    page.wait_for_function("!document.getElementById('entity-dialog').open")
+    assert 'Cliente de demonstração' in page.locator('#entity-list').inner_text()
+    page.locator('#entity-kind').select_option('reports')
+    page.locator('#entity-new').click()
+    page.locator('[data-entity-field=title]').fill('Visita de avaliação')
+    page.locator('[data-entity-field=findings]').fill('Registro fictício de teste')
+    page.locator('[data-entity-field=clientId]').select_option(label='Cliente de demonstração')
+    page.locator('#entity-form .primary').click()
+    page.wait_for_function("!document.getElementById('entity-dialog').open")
+    assert 'Visita de avaliação' in page.locator('#entity-list').inner_text()
+    page.wait_for_timeout(400)
+    page.reload();page.wait_for_selector('.service-card')
+    page.locator('.sidebar [data-view=business]').click()
+    assert 'Cliente de demonstração' in page.locator('#entity-list').inner_text()
+    page.screenshot(path=str(previews/'previa-gestao-pc.png'),full_page=True)
+    page.set_viewport_size({'width':390,'height':844})
+    assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+    page.screenshot(path=str(previews/'previa-gestao-celular.png'),full_page=True)
+    assert not errors,errors
+
+
+
+
+
+
+Success
+
+
+
+
+
+
+Ran $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+@'
+from pathlib import Path
+p=Path('central-app/tests/interface.py');s=p.read_text(encoding='utf-8').replace('from playwright.sync_api import sync_playwright','from playwright.sync_api import sync_playwright, expect');needle="    page.locator('#entity-form .primary').click()\n    page.wait_for_function(\"!document.getElementById('entity-dialog').open\")";repl="    page.locator('#entity-form .primary').click()\n    expect(page.locator('#entity-error')).to_contain_text('já cadastrado')\n    page.locator('[data-entity-field=phone]').fill('21988887777')\n    page.locator('#entity-form .primary').click()\n    expect(page.locator('#entity-dialog')).not_to_be_visible()";s=s.replace(needle,repl,1).replace("    page.wait_for_function(\"!document.getElementById('entity-dialog').open\")","    expect(page.locator('#entity-dialog')).not_to_be_visible()");p.write_text(s,encoding='utf-8')
+'@ | python -
+python central-app/tests/interface.py
+Shell
+$$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+@'
+from pathlib import Path
+p=Path('central-app/tests/interface.py');s=p.read_text(encoding='utf-8').replace('from playwright.sync_api import sync_playwright','from playwright.sync_api import sync_playwright, expect');needle="    page.locator('#entity-form .primary').click()\n    page.wait_for_function(\"!document.getElementById('entity-dialog').open\")";repl="    page.locator('#entity-form .primary').click()\n    expect(page.locator('#entity-error')).to_contain_text('já cadastrado')\n    page.locator('[data-entity-field=phone]').fill('21988887777')\n    page.locator('#entity-form .primary').click()\n    expect(page.locator('#entity-dialog')).not_to_be_visible()";s=s.replace(needle,repl,1).replace("    page.wait_for_function(\"!document.getElementById('entity-dialog').open\")","    expect(page.locator('#entity-dialog')).not_to_be_visible()");p.write_text(s,encoding='utf-8')
+'@ | python -
+python central-app/tests/interface.py
+
+
+PASS: desktop/mobile, c�lculo, ajustes, c�pia, persist�ncia, exporta��o/importa��o e descri��o sem HTML.
+
+
+
+
+
+
+Success
+
+
+
+
+
+
+Ran Start-Process -FilePath "$env:LOCALAPPDATA/Android/Sdk/emulator/emulator.exe" -ArgumentList '-avd','Medium_Phone_API_36.0','-no-window','-no-audio','-memory','1536','-cores','2','-no-snapshot-save' -WindowStyle Hidden
+Shell
+$Start-Process -FilePath "$env:LOCALAPPDATA/Android/Sdk/emulator/emulator.exe" -ArgumentList '-avd','Medium_Phone_API_36.0','-no-window','-no-audio','-memory','1536','-cores','2','-no-snapshot-save' -WindowStyle Hidden
+
+
+No output
+
+
+
+
+
+Success
+
+
+
+
+
+
+
+
+
+
+
+Worked for 9m 27s
+
+
+
+
+Os cenários de itens, limpeza e reutilização de clientes passaram. O teste também confirmou que falhas de gravação mantêm o formulário aberto e não mostram sucesso.
+Não foi necessária migração de banco: os registros existentes já comportam o vínculo por ID. Na sincronização, o cliente passa a ser enviado antes do orçamento. Cadastros criados separadamente offline com o mesmo contato serão preservados e sinalizados para conferência, sem mesclagem automática.
+
+
+
+
+  Ran commandsRan $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+@'
+from pathlib import Path
+p=Path('central-app/tests/quote_flows.py');s=p.read_text(encoding='utf-8');marker='  assert not errors,errors';addition='''  # Falha ao salvar orçamento com cliente novo: nada durável pela metade; retry idempotente.
+  builder();page.locator('#new-quote').click();add('Serviço offline',140);review()
+  page.locator('[data-field=client]').fill('Cliente do retry');page.locator('[data-field=phone]').fill('21955554444');page.locator('[data-field=location]').fill('Local de teste')
+  page.evaluate('window.failSave=true');page.locator('#save-quote').click();expect(page.locator('#quote-save-error')).to_contain_text('Disco indisponível')
+  assert page.evaluate("JSON.parse(localStorage.state).workspace.clients.length")==3
+  page.evaluate('window.failSave=false');save();finish_review()
+  assert page.evaluate("JSON.parse(localStorage.state).workspace.clients.length")==4
+  page.set_viewport_size({'width':320,'height':700});page.locator('#summary-open').click();assert page.evaluate('document.documentElement.scrollWidth<=innerWidth');page.locator('#continue-services').click()
+''';s=s.replace(marker,addition+marker);p.write_text(s,encoding='utf-8')
+p=Path('central-app/tests/windows.py');s=p.read_text(encoding='utf-8').replace('from playwright.sync_api import sync_playwright','from playwright.sync_api import sync_playwright, expect');marker="        assert page.evaluate(\"fetch('https://example.com').then(()=>false).catch(()=>true)\")";addition='''        page.locator('#review-open').click()
+        page.locator('[data-field=client]').fill('Cliente nativo de teste')
+        page.locator('[data-field=phone]').fill('21988887777')
+        page.locator('[data-field=location]').fill('Endereço de teste')
+        page.locator('#save-quote').click()
+        expect(page.locator('#quote-save-error')).to_have_text('')
+        page.locator('#review-dialog [aria-label=Fechar]').click()
+        page.reload();page.wait_for_selector('.service-card')
+        page.locator('.sidebar [data-view=business]').click()
+        expect(page.locator('#entity-list')).to_contain_text('Cliente nativo de teste')
+''';s=s.replace(marker,addition+marker);p.write_text(s,encoding='utf-8')
+'@ | python -
+python central-app/tests/quote_flows.py
+python central-app/tests/windows.py
+Shell
+$$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+@'
+from pathlib import Path
+p=Path('central-app/tests/quote_flows.py');s=p.read_text(encoding='utf-8');marker='  assert not errors,errors';addition='"'''"'  # Falha ao salvar orçamento com cliente novo: nada durável pela metade; retry idempotente.
+  builder();page.locator('#new-quote').click();add('Serviço offline',140);review()
+  page.locator('[data-field=client]').fill('Cliente do retry');page.locator('[data-field=phone]').fill('21955554444');page.locator('[data-field=location]').fill('Local de teste')
+  page.evaluate('window.failSave=true');page.locator('#save-quote').click();expect(page.locator('#quote-save-error')).to_contain_text('Disco indisponível')
+  assert page.evaluate("JSON.parse(localStorage.state).workspace.clients.length")==3
+  page.evaluate('window.failSave=false');save();finish_review()
+  assert page.evaluate("JSON.parse(localStorage.state).workspace.clients.length")==4
+  page.set_viewport_size({'width':320,'height':700});page.locator('#summary-open').click();assert page.evaluate('document.documentElement.scrollWidth<=innerWidth');page.locator('#continue-services').click()
+'"'''"';s=s.replace(marker,addition+marker);p.write_text(s,encoding='utf-8')
+p=Path('central-app/tests/windows.py');s=p.read_text(encoding='utf-8').replace('from playwright.sync_api import sync_playwright','from playwright.sync_api import sync_playwright, expect');marker="        assert page.evaluate(\"fetch('https://example.com').then(()=>false).catch(()=>true)\")";addition='"'''"'        page.locator('#review-open').click()
+        page.locator('[data-field=client]').fill('Cliente nativo de teste')
+        page.locator('[data-field=phone]').fill('21988887777')
+        page.locator('[data-field=location]').fill('Endereço de teste')
+        page.locator('#save-quote').click()
+        expect(page.locator('#quote-save-error')).to_have_text('"''"')
+        page.locator('#review-dialog [aria-label=Fechar]').click()
+        page.reload();page.wait_for_selector('.service-card')
+        page.locator('.sidebar [data-view=business]').click()
+        expect(page.locator('#entity-list')).to_contain_text('Cliente nativo de teste')
+'"'''"';s=s.replace(marker,addition+marker);p.write_text(s,encoding='utf-8')
+'@ | python -
+python central-app/tests/quote_flows.py
+python central-app/tests/windows.py
+
+
+PASS: cen�rios mobile 1-5, edi��o, vazio, offline, clientes, recarga, duplicidade e falha/retry de grava��o
+PASS: Electron nativo, persist�ncia em disco, sandbox, isolamento e bloqueio de rede/URLs indevidas.
+Traceback (most recent call last):
+  File "C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX\central-app\tests\windows.py", line 48, in <module>
+    proc.wait(timeout=20)
+    ~~~~~~~~~^^^^^^^^^^^^
+  File "C:\Python314\Lib\subprocess.py", line 1279, in wait
+    return self._wait(timeout=timeout)
+           ~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\subprocess.py", line 1608, in _wait
+    raise TimeoutExpired(self.args, timeout)
+subprocess.TimeoutExpired: Command '['C:\\Users\\RTEC\\Documents\\ALTIMAX\\EMPRESA DE ELETRICA\\VSCODECODEX\\central-app\\node_modules\\electron\\dist\\electron.exe', 'C:\\Users\\RTEC\\Documents\\ALTIMAX\\EMPRESA DE ELETRICA\\VSCODECODEX\\central-app', '--user-data-dir=C:\\Users\\RTEC\\AppData\\Local\\Temp\\altimax-native-4twg4ayz', '--remote-debugging-port=19343']' timed out after 20 seconds
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Python314\Lib\shutil.py", line 701, in _rmtree_unsafe
+    os.unlink(fullname)
+    ~~~~~~~~~^^^^^^^^^^
+PermissionError: [WinError 5] Acesso negado: 'C:\\Users\\RTEC\\AppData\\Local\\Temp\\altimax-native-4twg4ayz\\DawnGraphiteCache\\data_0'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\RTEC\Documents\ALTIMAX\EMPRESA DE ELETRICA\VSCODECODEX\central-app\tests\windows.py", line 7, in <module>
+    with TemporaryDirectory(prefix='altimax-native-') as temp, sync_playwright() as p:
+         ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\tempfile.py", line 972, in __exit__
+    self.cleanup()
+    ~~~~~~~~~~~~^^
+  File "C:\Python314\Lib\tempfile.py", line 976, in cleanup
+    self._rmtree(self.name, ignore_errors=self._ignore_cleanup_errors)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\tempfile.py", line 956, in _rmtree
+    _shutil.rmtree(name, onexc=onexc)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\shutil.py", line 852, in rmtree
+    _rmtree_impl(path, dir_fd, onexc)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\shutil.py", line 705, in _rmtree_unsafe
+    onexc(os.unlink, fullname, err)
+    ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\tempfile.py", line 931, in onexc
+    _os.unlink(path)
+    ~~~~~~~~~~^^^^^^
+PermissionError: [WinError 5] Acesso negado: 'C:\\Users\\RTEC\\AppData\\Local\\Temp\\altimax-native-4twg4ayz\\DawnGraphiteCache\\data_0'
+
+
+
+
+
+
+Exit code 1
+
+
+
+
+
+
+Ran & "$env:LOCALAPPDATA/Android/Sdk/platform-tools/adb.exe" devices
+& "$env:LOCALAPPDATA/Android/Sdk/platform-tools/adb.exe" shell getprop sys.boot_completed
+Shell
+$& "$env:LOCALAPPDATA/Android/Sdk/platform-tools/adb.exe" devices
+& "$env:LOCALAPPDATA/Android/Sdk/platform-tools/adb.exe" shell getprop sys.boot_completed
+
+
+List of devices attached
+emulator-5554	device
+
+
+
+
+
+
+
+
+Success
+
+
+
+
+
+
+
+
+
+
+
+
+You've hit your usage limit. Upgrade your plan or add credits to continue, or try again at Oct 6, 2026, 3:52 AM.
